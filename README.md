@@ -166,6 +166,7 @@ One file per tunnel: `/etc/golden-gre/<name>.conf`. `<name>` is the systemd inst
 | `DNS_PORT` | ⬜ | `53` | `dns` facade: UDP port on both ends. Only 53 passed on the measured path. |
 | `MTU` | ⬜ | `1380` | Tunnel MTU. Default `1380`. Overhead on the wire is 75 bytes with the `dns` facade (20 IP + 8 UDP + 39 DNS + 8 GRE), 36 with `icmp`. |
 | `GRE_KEY` | ⬜ | `41` | GRE key. **Must match on both ends.** Default `41`. Tunnels on one host need different keys (the kernel finds a tunnel by endpoints and key, and every tunnel here has the same loopback endpoints). |
+| `FEC` | ⬜ | `10:5` | Forward error correction on what **this end sends**: after every K packets the relay sends M Reed-Solomon parity packets, and the peer rebuilds up to M lost packets per block without waiting for TCP to resend them. Costs M/K extra bandwidth. Set it on the end that sends into the lossy direction; the peer decodes without any setting. See [Lossy paths](#-lossy-paths-fec). |
 | `RELAY_PORT` | ⬜ | `5601` | Loopback UDP port between the tunnel and the relay. **Unique per tunnel** on a host. |
 | `FOU_PORT` | ⬜ | `5599` | Loopback FOU listener port. **Unique per tunnel** on a host; `up` refuses a port another tunnel holds. |
 | `ROUTES` | ⬜ | `"192.0.2.0/24 198.18.0.0/24"` | Space-separated CIDRs to route via this tunnel. |
@@ -351,6 +352,7 @@ Everything a test creates lives under `/tmp/tb` on the servers (device `tb0`, ov
 | `RTNETLINK answers: File exists` | Another tunnel with the same `GRE_KEY` on this host, or a stale device | Different `GRE_KEY` per tunnel; otherwise `systemctl restart golden-gre@<name>`. |
 | Device `UP`, ping 100% loss, relay line shows `tx` growing, `rx` flat | The path cuts the disguise, or the peer's relay isn't running | `tcpdump -ni any udp port 53` on the peer should show queries arriving; run `bench/carriers.sh` to see what your path passes. |
 | `bad` grows in the relay line | Something else sends well-formed-looking junk to the relay's port | Harmless, rejected before delivery. Firewall the port to the peer if it bothers you. |
+| Bulk traffic crawls in one direction only | That direction loses packets | Measure loss per direction (`iperf3 -u -b 20M`, with and without `-R`). Set `FEC` on the end that sends into the loss; see [Lossy paths](#-lossy-paths-fec). |
 | Ping passes, bulk traffic crawls | Sender not on BBR, or MTU too high for your path | `sysctl net.ipv4.tcp_congestion_control` → `bbr`; lower `MTU`. |
 | Forwarded TCP connects then stalls | PMTU black hole | MSS clamp present? `iptables -t mangle -S FORWARD` (look for `mss`). Lower `MTU`. |
 | Gone after reboot | Unit not enabled | `systemctl is-enabled golden-gre@<name>`. |

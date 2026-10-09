@@ -58,6 +58,7 @@ TUN_ADDR=10.99.99.1/30
 ROUTES="198.18.0.0/24"
 NAT_SRC=10.99.99.0/30
 GRE_KEY=42
+FEC=8:4
 EOF
 cat >"/etc/golden-gre/$CB.conf" <<'EOF'
 DEV=gre1
@@ -78,6 +79,8 @@ ip netns exec "$A" "$UP" "$CA" >/dev/null   # second run must be harmless
 
 ip netns exec "$A" ping -c 3 -W 2 -q 10.99.99.2 >/dev/null || fail "no ping across the tunnel (first packets must pass: no learning delay)"
 ok "ping across the tunnel, from the first packet"
+grep -q 'fec 8:4' "$tmp/relay-$CA.log" || fail "FEC=8:4 in the config did not reach the relay: $(cat "$tmp/relay-$CA.log")"
+ok "FEC from the config reaches the relay; the peer decodes without the setting"
 
 ip -n "$A" -d link show gre1 | grep -q 'encap fou encap-sport 5599 encap-dport 5601' \
   || fail "tunnel is not GRE-in-FOU on the loopback relay ports"

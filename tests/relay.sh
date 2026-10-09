@@ -19,8 +19,10 @@ done
 
 tmp="$(mktemp -d)"
 pids=()
+nets=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
+  for n in "${nets[@]}"; do ip netns del "$n" 2>/dev/null || true; done
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -121,6 +123,96 @@ if [ "$(id -u)" -eq 0 ]; then
   ok "icmp facade: both directions, bulk delivery, sizes intact"
 else
   echo "skip: icmp facade needs root"
+fi
+
+# FEC under loss: two network namespaces joined by a veth pair that drops 20% of packets each way.
+# The sender's relay runs with or without --fec; the receiver's relay never has --fec (decoding needs
+# no flag). Every packet carries its sequence number and a size and content derived from it, so the
+# receiver catches loss, corruption (a wrong reconstruction) and duplicates.
+fec_under_loss() {  # <expected-min-delivered> <expected-max-delivered> [K:M]
+  local min="$1" max="$2" fec="${3:-}" na="ggf-a-$$" nb="ggf-b-$$"
+  ip netns add "$na"
+  ip netns add "$nb"
+  nets+=("$na" "$nb")
+  ip link add va netns "$na" type veth peer name vb netns "$nb"
+  ip -n "$na" addr add 192.0.2.1/24 dev va
+  ip -n "$nb" addr add 192.0.2.2/24 dev vb
+  for ns in "$na" "$nb"; do ip -n "$ns" link set lo up; done
+  ip -n "$na" link set va up
+  ip -n "$nb" link set vb up
+  tc -n "$na" qdisc add dev va root netem loss 20%
+  tc -n "$nb" qdisc add dev vb root netem loss 20%
+  ip netns exec "$na" "$tmp/relay" --facade dns --bind 192.0.2.1 --peer 192.0.2.2 --local 127.0.0.1:5601 \
+    ${fec:+--fec "$fec"} >"$tmp/fa.log" 2>&1 &
+  pids+=("$!")
+  ip netns exec "$nb" "$tmp/relay" --facade dns --bind 192.0.2.2 --peer 192.0.2.1 --local 127.0.0.1:5601 \
+    --reply 127.0.0.1:5599 >"$tmp/fb.log" 2>&1 &
+  pids+=("$!")
+  sleep 0.5
+  ip netns exec "$nb" python3 - "$min" "$max" >"$tmp/recv.out" 2>&1 <<'PY' &
+import socket, sys
+lo, hi = float(sys.argv[1]), float(sys.argv[2])
+N = 4000
+def expect(seq):
+    size = 40 + (seq * 7919) % 1340          # 40..1379 bytes, so blocks mix sizes
+    return seq.to_bytes(4, "big") + bytes((seq * 31 + j) & 255 for j in range(size - 4))
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", 5599))
+s.settimeout(3)
+seen, bad, dup = set(), 0, 0
+try:
+    while True:
+        d = s.recvfrom(4096)[0]
+        seq = int.from_bytes(d[:4], "big")
+        if seq >= N or d != expect(seq):
+            bad += 1
+        elif seq in seen:
+            dup += 1
+        else:
+            seen.add(seq)
+except socket.timeout:
+    pass
+frac = len(seen) / N
+print("delivered %d of %d (%.2f%%), corrupt %d, duplicate %d" % (len(seen), N, 100 * frac, bad, dup))
+assert bad == 0 and dup == 0, "corrupt or duplicate packets reached the tunnel"
+assert lo <= frac <= hi, "delivered fraction %.4f outside [%s, %s]" % (frac, lo, hi)
+PY
+  local rp=$!
+  sleep 0.3
+  ip netns exec "$na" python3 - <<'PY'
+import socket, time
+N = 4000
+def expect(seq):
+    size = 40 + (seq * 7919) % 1340
+    return seq.to_bytes(4, "big") + bytes((seq * 31 + j) & 255 for j in range(size - 4))
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", 5599))
+for seq in range(N):
+    s.sendto(expect(seq), ("127.0.0.1", 5601))
+    if seq % 40 == 39:
+        time.sleep(0.01)    # about 4000 packets/s
+    if seq % 500 == 499:
+        time.sleep(0.05)    # idle gaps, so partly filled blocks must be flushed by the timer
+PY
+  local rc=0
+  wait "$rp" || rc=$?
+  cat "$tmp/recv.out"
+  [ "$rc" -eq 0 ] || fail "fec ${fec:-off}: $(tail -1 "$tmp/recv.out")"
+  kill "${pids[@]}" 2>/dev/null || true
+  wait 2>/dev/null || true
+  pids=()
+  ip netns del "$na"
+  ip netns del "$nb"
+  nets=()
+}
+
+if [ "$(id -u)" -eq 0 ] && modprobe sch_netem 2>/dev/null; then
+  fec_under_loss 0.70 0.88
+  ok "20% wire loss without FEC loses about a fifth (the loss is real)"
+  fec_under_loss 0.995 1.0 10:10
+  ok "20% wire loss with --fec 10:10: >= 99.5% delivered, mixed sizes and partly filled blocks intact"
+else
+  echo "skip: FEC loss test needs root and sch_netem"
 fi
 
 echo "relay: PASS"

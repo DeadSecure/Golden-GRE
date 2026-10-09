@@ -15,5 +15,7 @@ CONF="/etc/golden-gre/${NAME}.conf"
 RELAY="${GOLDEN_GRE_RELAY:-/usr/local/sbin/golden-gre-relay}"
 [ -x "$RELAY" ] || { echo "golden-gre: relay binary $RELAY not found (run install.sh)" >&2; exit 1; }
 
+# FEC=K:M adds M parity packets per K on what this end sends; the peer decodes without any setting.
 exec "$RELAY" --facade "${FACADE:-dns}" --bind "${LOCAL_PUB}" --peer "${REMOTE_PUB}" \
-  --local "127.0.0.1:${RELAY_PORT:-5601}" --reply "127.0.0.1:${FOU_PORT:-5599}" --port "${DNS_PORT:-53}"
+  --local "127.0.0.1:${RELAY_PORT:-5601}" --reply "127.0.0.1:${FOU_PORT:-5599}" --port "${DNS_PORT:-53}" \
+  ${FEC:+--fec "$FEC"}
