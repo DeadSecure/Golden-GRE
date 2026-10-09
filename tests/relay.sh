@@ -128,7 +128,8 @@ fi
 # FEC under loss: two network namespaces joined by a veth pair that drops 20% of packets each way.
 # The sender's relay runs with or without --fec; the receiver's relay never has --fec (decoding needs
 # no flag). Every packet carries its sequence number and a size and content derived from it, so the
-# receiver catches loss, corruption (a wrong reconstruction) and duplicates.
+# receiver catches loss, corruption (a wrong reconstruction) and duplicates. Halfway through, the
+# sender's relay restarts (its block numbers start over) while the receiver's keeps running.
 fec_under_loss() {  # <expected-min-delivered> <expected-max-delivered> [K:M]
   local min="$1" max="$2" fec="${3:-}" na="ggf-a-$$" nb="ggf-b-$$"
   ip netns add "$na"
@@ -142,9 +143,13 @@ fec_under_loss() {  # <expected-min-delivered> <expected-max-delivered> [K:M]
   ip -n "$nb" link set vb up
   tc -n "$na" qdisc add dev va root netem loss 20%
   tc -n "$nb" qdisc add dev vb root netem loss 20%
-  ip netns exec "$na" "$tmp/relay" --facade dns --bind 192.0.2.1 --peer 192.0.2.2 --local 127.0.0.1:5601 \
-    ${fec:+--fec "$fec"} >"$tmp/fa.log" 2>&1 &
-  pids+=("$!")
+  start_sender() {
+    ip netns exec "$na" "$tmp/relay" --facade dns --bind 192.0.2.1 --peer 192.0.2.2 --local 127.0.0.1:5601 \
+      ${fec:+--fec "$fec"} >>"$tmp/fa.log" 2>&1 &
+    apid=$!
+    pids+=("$apid")
+  }
+  start_sender
   ip netns exec "$nb" "$tmp/relay" --facade dns --bind 192.0.2.2 --peer 192.0.2.1 --local 127.0.0.1:5601 \
     --reply 127.0.0.1:5599 >"$tmp/fb.log" 2>&1 &
   pids+=("$!")
@@ -179,25 +184,32 @@ assert lo <= frac <= hi, "delivered fraction %.4f outside [%s, %s]" % (frac, lo,
 PY
   local rp=$!
   sleep 0.3
-  ip netns exec "$na" python3 - <<'PY'
-import socket, time
-N = 4000
+  send_range() {  # <first> <end>
+    ip netns exec "$na" python3 - "$1" "$2" <<'PY'
+import socket, sys, time
 def expect(seq):
     size = 40 + (seq * 7919) % 1340
     return seq.to_bytes(4, "big") + bytes((seq * 31 + j) & 255 for j in range(size - 4))
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(("127.0.0.1", 5599))
-for seq in range(N):
+for seq in range(int(sys.argv[1]), int(sys.argv[2])):
     s.sendto(expect(seq), ("127.0.0.1", 5601))
     if seq % 40 == 39:
         time.sleep(0.01)    # about 4000 packets/s
     if seq % 500 == 499:
         time.sleep(0.05)    # idle gaps, so partly filled blocks must be flushed by the timer
 PY
+  }
+  send_range 0 2000
+  kill "$apid"
+  wait "$apid" 2>/dev/null || true
+  start_sender
+  sleep 0.5
+  send_range 2000 4000
   local rc=0
   wait "$rp" || rc=$?
   cat "$tmp/recv.out"
-  [ "$rc" -eq 0 ] || fail "fec ${fec:-off}: $(tail -1 "$tmp/recv.out")"
+  [ "$rc" -eq 0 ] || fail "fec ${fec:-off}: $(tail -1 "$tmp/recv.out"); sender relay: $(cat "$tmp/fa.log")"
   kill "${pids[@]}" 2>/dev/null || true
   wait 2>/dev/null || true
   pids=()

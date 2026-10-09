@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -321,7 +322,10 @@ static void fec_input(const uint8_t *p, size_t len) {
   }
   struct slot *s = &slots[id % NSLOT];
   if (!s->used || s->id != id) {
-    if (s->used && (int32_t)(id - s->id) < 0) {  // late packet of a block whose slot is reused
+    // a late packet of a block whose slot is already reused; anything further back is a sender that
+    // restarted (it numbers its blocks from a new random start), so the slot starts over
+    uint32_t behind = s->id - id;
+    if (s->used && behind <= 4 * NSLOT) {
       if (!par) local_emit(body, blen);
       return;
     }
@@ -373,6 +377,8 @@ int main(int argc, char **argv) {
     return 1;
   }
   gf_init();
+  // a random first block number, so the peer cannot mistake a restarted sender's blocks for old ones
+  if (getrandom(&enc.id, sizeof enc.id, 0) != sizeof enc.id) enc.id = (uint32_t)now_ms();
   is_dns = !strcmp(facade, "dns");
   char lip[64];
   snprintf(lip, sizeof lip, "%s", local);
