@@ -246,7 +246,12 @@ static void local_emit(const uint8_t *p, size_t len) {
 // so any K of the K + M packets of a block rebuild it. Packets of a block differ in size: each counts as
 // the vector (2-byte length, payload, zero padding) and parity is as long as the longest.
 
-static uint8_t gexp[512], glog[256], gmul[256][256];
+static uint8_t gexp[512], glog[256], gmul[256][256], cauchy[MMAX][KMAX];
+// split-nibble tables: c * b = nib[c][0][b & 15] ^ nib[c][1][b >> 4], 16 bytes each, so a SIMD byte
+// shuffle multiplies 16 or 32 bytes by c at once
+static uint8_t nib[256][2][16];
+
+static uint8_t ginv(uint8_t a) { return gexp[255 - glog[a]]; }
 
 static void gf_init(void) {
   unsigned x = 1;
@@ -258,15 +263,87 @@ static void gf_init(void) {
   }
   for (int a = 1; a < 256; a++)
     for (int b = 1; b < 256; b++) gmul[a][b] = gexp[glog[a] + glog[b]];
+  for (int c = 0; c < 256; c++)
+    for (int n = 0; n < 16; n++) {
+      nib[c][0][n] = gmul[c][n];
+      nib[c][1][n] = gmul[c][n << 4];
+    }
+  for (int j = 0; j < MMAX; j++)
+    for (int i = 0; i < KMAX; i++) cauchy[j][i] = ginv((uint8_t)((0x80 | j) ^ i));
 }
 
-static uint8_t ginv(uint8_t a) { return gexp[255 - glog[a]]; }
+static uint8_t coef(int j, int i) { return cauchy[j][i]; }
 
-static uint8_t coef(int j, int i) { return ginv((uint8_t)((0x80 | j) ^ i)); }
-
-static void muladd(uint8_t *dst, const uint8_t *src, uint8_t c, size_t n) {  // dst += c * src
+// dst += c * src, three ways; gf_pick chooses one at startup
+static void muladd_table(uint8_t *dst, const uint8_t *src, uint8_t c, size_t n) {
   const uint8_t *row = gmul[c];
   for (size_t x = 0; x < n; x++) dst[x] ^= row[src[x]];
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define GF_X86 1
+
+__attribute__((target("avx2"))) static void muladd_avx2(uint8_t *dst, const uint8_t *src, uint8_t c, size_t n) {
+  const __m256i lo = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)nib[c][0]));
+  const __m256i hi = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)nib[c][1]));
+  const __m256i mask = _mm256_set1_epi8(0x0F);
+  size_t x = 0;
+  for (; x + 32 <= n; x += 32) {
+    __m256i s = _mm256_loadu_si256((const __m256i *)(src + x));
+    __m256i p = _mm256_xor_si256(_mm256_shuffle_epi8(lo, _mm256_and_si256(s, mask)),
+                                 _mm256_shuffle_epi8(hi, _mm256_and_si256(_mm256_srli_epi64(s, 4), mask)));
+    _mm256_storeu_si256((__m256i *)(dst + x), _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)(dst + x)), p));
+  }
+  muladd_table(dst + x, src + x, c, n - x);
+}
+
+__attribute__((target("ssse3"))) static void muladd_ssse3(uint8_t *dst, const uint8_t *src, uint8_t c, size_t n) {
+  const __m128i lo = _mm_loadu_si128((const __m128i *)nib[c][0]);
+  const __m128i hi = _mm_loadu_si128((const __m128i *)nib[c][1]);
+  const __m128i mask = _mm_set1_epi8(0x0F);
+  size_t x = 0;
+  for (; x + 16 <= n; x += 16) {
+    __m128i s = _mm_loadu_si128((const __m128i *)(src + x));
+    __m128i p = _mm_xor_si128(_mm_shuffle_epi8(lo, _mm_and_si128(s, mask)),
+                              _mm_shuffle_epi8(hi, _mm_and_si128(_mm_srli_epi64(s, 4), mask)));
+    _mm_storeu_si128((__m128i *)(dst + x), _mm_xor_si128(_mm_loadu_si128((const __m128i *)(dst + x)), p));
+  }
+  muladd_table(dst + x, src + x, c, n - x);
+}
+#endif
+
+static void (*muladd)(uint8_t *dst, const uint8_t *src, uint8_t c, size_t n) = muladd_table;
+static const char *gf_impl = "table";
+
+// The fastest multiply this CPU has, used only after it matched the table for every coefficient and a
+// spread of lengths (vector loop and tail): parity must be byte-identical to what any relay computes.
+static void gf_pick(void) {
+#ifdef GF_X86
+  __builtin_cpu_init();
+  if (__builtin_cpu_supports("avx2")) {
+    muladd = muladd_avx2;
+    gf_impl = "avx2";
+  } else if (__builtin_cpu_supports("ssse3")) {
+    muladd = muladd_ssse3;
+    gf_impl = "ssse3";
+  }
+#endif
+  uint8_t src[100], a[100], b[100];
+  for (int c = 0; c < 256; c++) {
+    size_t n = 1 + (size_t)(c * 37) % 100;
+    for (size_t x = 0; x < n; x++) {
+      src[x] = (uint8_t)(x * 151 + c * 7 + 13);
+      a[x] = b[x] = (uint8_t)(x * 29 + c);
+    }
+    muladd_table(a, src, (uint8_t)c, n);
+    muladd(b, src, (uint8_t)c, n);
+    if (memcmp(a, b, n)) {
+      muladd = muladd_table;
+      gf_impl = "table (the fast path did not match)";
+      return;
+    }
+  }
 }
 
 static void muladd_vec(uint8_t *dst, const uint8_t *p, size_t len, uint8_t c) {  // dst += c * (len, p)
@@ -285,27 +362,26 @@ static void fec_head(uint8_t *h, uint32_t id, int idx, int k) {
   h[6] = k;
 }
 
-// sender
+// sender: every parity row grows as each packet of the block goes out (the packet is still in cache and
+// need not be kept), and goes out itself when the block is full or FLUSH_MS old
 static int fec_k, fec_m;
 static struct {
   uint32_t id;
   int k;
-  size_t len[KMAX], maxlen;
-  uint8_t data[KMAX][MAXPAY];
+  size_t maxlen;
+  uint8_t par[MMAX][2 + MAXPAY];
   uint64_t start;
 } enc;
 
 static void fec_flush(void) {  // send the current block's parity and start the next block
-  static uint8_t par[2 + MAXPAY];
   uint8_t h[FEC_HDR];
   int k = enc.k, m = (fec_m * k + fec_k - 1) / fec_k;
   size_t L = 2 + enc.maxlen;
   for (int j = 0; j < m; j++) {
-    memset(par, 0, L);
-    for (int i = 0; i < k; i++) muladd_vec(par, enc.data[i], enc.len[i], coef(j, i));
     fec_head(h, enc.id, 0x80 | j, k);
-    wire_emit(h, FEC_HDR, par, L);
+    wire_emit(h, FEC_HDR, enc.par[j], L);
   }
+  for (int j = 0; j < fec_m; j++) memset(enc.par[j], 0, L);
   enc.id++;
   enc.k = 0;
   enc.maxlen = 0;
@@ -320,8 +396,7 @@ static void send_tunnel_packet(const uint8_t *p, size_t len) {
   if (!enc.k) enc.start = now_ms();
   fec_head(h, enc.id, enc.k, 0);
   wire_emit(h, FEC_HDR, p, len);
-  memcpy(enc.data[enc.k], p, len);
-  enc.len[enc.k] = len;
+  for (int j = 0; j < fec_m; j++) muladd_vec(enc.par[j], p, len, coef(j, enc.k));
   if (len > enc.maxlen) enc.maxlen = len;
   if (++enc.k == fec_k) fec_flush();
 }
@@ -456,6 +531,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   gf_init();
+  gf_pick();
   // a random first block number, so the peer cannot mistake a restarted sender's blocks for old ones
   if (getrandom(&enc.id, sizeof enc.id, 0) != sizeof enc.id) enc.id = (uint32_t)now_ms();
   is_dns = !strcmp(facade, "dns");
@@ -499,8 +575,8 @@ int main(int argc, char **argv) {
   }
   time_t next = time(NULL) + 60;
   struct pollfd pf[2] = {{loc, POLLIN, 0}, {rx, POLLIN, 0}};
-  printf("golden-gre-relay up: %s %s <-> %s, local %s, fec %s, gso %s\n", facade, bind_ip, peer_ip, local,
-         fec_arg ? fec_arg : "off", use_gso ? "on" : "off");
+  printf("golden-gre-relay up: %s %s <-> %s, local %s, fec %s, gso %s, gf %s\n", facade, bind_ip, peer_ip, local,
+         fec_arg ? fec_arg : "off", use_gso ? "on" : "off", gf_impl);
   fflush(stdout);
 
   for (;;) {
