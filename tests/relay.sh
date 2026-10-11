@@ -110,13 +110,16 @@ if facade == "dns":
         pass
 print("delivered %d of %d" % (got[0], N))
 PY
-  kill "${pids[@]}" 2>/dev/null || true
+  kill "${pids[@]}" 2>/dev/null || true   # SIGTERM: each relay prints its counters and exits
   wait 2>/dev/null || true
   pids=()
+  if [ "$facade" = dns ]; then
+    grep -qE 'gso=[1-9]' "$tmp/a.log" || fail "dns facade: bulk frames never went out as one UDP GSO send: $(tail -2 "$tmp/a.log")"
+  fi
 }
 
 run_facade dns
-ok "dns facade: both directions (one end --reply, one learned), bulk delivery, sizes intact, non-peer frame ignored"
+ok "dns facade: both directions (one end --reply, one learned), bulk delivery in UDP GSO batches, sizes intact, non-peer frame ignored"
 
 if [ "$(id -u)" -eq 0 ]; then
   run_facade icmp
@@ -141,11 +144,16 @@ fec_under_loss() {  # <expected-min-delivered> <expected-max-delivered> [K:M]
   for ns in "$na" "$nb"; do ip -n "$ns" link set lo up; done
   ip -n "$na" link set va up
   ip -n "$nb" link set vb up
+  # pinned neighbours: netem drops ARP too, and a few seconds of failed resolution would read as tunnel loss
+  ip -n "$na" neigh add 192.0.2.2 lladdr "$(ip -n "$nb" -br link show dev vb | awk '{print $3}')" dev va nud permanent
+  ip -n "$nb" neigh add 192.0.2.1 lladdr "$(ip -n "$na" -br link show dev va | awk '{print $3}')" dev vb nud permanent
   tc -n "$na" qdisc add dev va root netem loss 20%
   tc -n "$nb" qdisc add dev vb root netem loss 20%
+  # --gso off: netem would drop a whole UDP GSO send (up to 32 frames) as one packet, which is not the
+  # per-packet loss this test models; on a real NIC the frames leave, and get lost, one by one
   start_sender() {
     ip netns exec "$na" "$tmp/relay" --facade dns --bind 192.0.2.1 --peer 192.0.2.2 --local 127.0.0.1:5601 \
-      ${fec:+--fec "$fec"} >>"$tmp/fa.log" 2>&1 &
+      --gso off ${fec:+--fec "$fec"} >>"$tmp/fa.log" 2>&1 &
     apid=$!
     pids+=("$apid")
   }

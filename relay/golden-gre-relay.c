@@ -10,9 +10,13 @@
 // packets are never held back. Only the sending side needs the flag: every relay decodes FEC frames and
 // still accepts plain ones, so turn it on for the direction that loses packets.
 //
+// With the dns facade, runs of equal-size frames go out as one UDP GSO send (see wire_flush); --gso off
+// sends every frame on its own (it is also switched off by itself where the kernel cannot do it).
+// SIGTERM/SIGINT print the counters and exit.
+//
 //   gcc -O2 -Wall -o golden-gre-relay golden-gre-relay.c
 //   golden-gre-relay --facade dns|icmp --bind <public_ip> --peer <peer_ip> --local <ip:port>
-//                    [--reply <ip:port>] [--port 53] [--itype 0] [--fec K:M]
+//                    [--reply <ip:port>] [--port 53] [--itype 0] [--fec K:M] [--gso on|off]
 //
 // dns:  UDP from an ephemeral port to <peer>:53, framed as a DNS query (one question, EDNS0 OPT record
 //       whose RDATA is the payload); listens on <bind>:53 (--port).
@@ -22,6 +26,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +51,16 @@
 #define NSLOT 64        // blocks the receiver keeps open
 #define FLUSH_MS 5
 #define MAXPAY (BUF - HEAD - FEC_HDR - 2)  // largest tunnel packet; parity carries a 2-byte length too
+#define GSO_MAX 32       // frames per UDP GSO send (the kernel allows 64 on older versions)
+#define GSO_BYTES 60000  // and bytes per send (one UDP datagram before segmentation)
+#define GSO_FRAME 1472   // frames above this would not fit a 1500-byte MTU unfragmented: sent alone
+
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+#ifndef SOL_UDP
+#define SOL_UDP 17
+#endif
 
 static const uint8_t QUESTION[16] = {5, 'p', 'r', 'o', 'b', 'e', 4, 't', 'e', 's', 't', 0, 0, 16, 0, 1};
 
@@ -130,10 +145,71 @@ static struct iovec wiov[OUTQ], liov[OUTQ];
 static struct mmsghdr wmsg[OUTQ], lmsg[OUTQ];
 static int nw, nl;
 
+// UDP GSO (dns facade): a run of equal-size frames, optionally ending in one shorter frame, goes to the
+// kernel as one send with UDP_SEGMENT. The kernel builds one packet for the whole run and the NIC (or the
+// kernel, late) cuts it into the frames: one route lookup, one allocation and one virtio doorbell per run
+// instead of per frame, which is most of what a relay on a small virtual machine spends its CPU on.
+static int use_gso;
+static unsigned long ngso;
+static volatile sig_atomic_t stopping;
+
+static void on_stop(int sig) {
+  (void)sig;
+  stopping = 1;
+}
+
 static void wire_flush(void) {
+  static struct mmsghdr g[OUTQ];
+  static union { char buf[CMSG_SPACE(sizeof(uint16_t))]; struct cmsghdr align; } cm[OUTQ];
+  static int first[OUTQ], nseg[OUTQ];
   if (!nw) return;
-  int sent = sendmmsg(tx, wmsg, nw, 0);
-  if (sent > 0) ntx += sent;
+  if (!use_gso) {
+    int sent = sendmmsg(tx, wmsg, nw, 0);
+    if (sent > 0) ntx += sent;
+    nw = 0;
+    return;
+  }
+  int ng = 0;
+  for (int i = 0; i < nw;) {
+    size_t sz = wiov[i].iov_len;
+    int n = 1, cap = sz <= GSO_FRAME ? (int)(GSO_BYTES / sz) : 1;
+    if (cap > GSO_MAX) cap = GSO_MAX;
+    while (i + n < nw && n < cap && wiov[i + n].iov_len <= sz)
+      if (wiov[i + n++].iov_len < sz) break;  // a shorter frame may only end a run
+    g[ng].msg_hdr = (struct msghdr){.msg_name = &peer, .msg_namelen = sizeof peer, .msg_iov = &wiov[i], .msg_iovlen = n};
+    if (n > 1) {
+      uint16_t s16 = sz;
+      g[ng].msg_hdr.msg_control = cm[ng].buf;
+      g[ng].msg_hdr.msg_controllen = sizeof cm[ng].buf;
+      struct cmsghdr *c = CMSG_FIRSTHDR(&g[ng].msg_hdr);
+      c->cmsg_level = SOL_UDP;
+      c->cmsg_type = UDP_SEGMENT;
+      c->cmsg_len = CMSG_LEN(sizeof s16);
+      memcpy(CMSG_DATA(c), &s16, sizeof s16);
+    }
+    first[ng] = i;
+    nseg[ng++] = n;
+    i += n;
+  }
+  for (int j = 0; j < ng;) {
+    int sent = sendmmsg(tx, g + j, ng - j, 0);
+    if (sent > 0) {
+      for (int k = j; k < j + sent; k++) {
+        ntx += nseg[k];
+        if (nseg[k] > 1) ngso++;
+      }
+      j += sent;
+      continue;
+    }
+    if (nseg[j] > 1 && (errno == EIO || errno == EINVAL)) {  // no UDP GSO on this path: plain sends from now on
+      printf("udp gso unavailable (%s); sending frames one by one\n", strerror(errno));
+      fflush(stdout);
+      use_gso = 0;
+      int rest = sendmmsg(tx, wmsg + first[j], nw - first[j], 0);
+      if (rest > 0) ntx += rest;
+    }
+    break;  // anything else (a full socket buffer): drop the rest, as a plain send would
+  }
   nw = 0;
 }
 
@@ -357,6 +433,7 @@ static void fec_input(const uint8_t *p, size_t len) {
 
 int main(int argc, char **argv) {
   const char *facade = NULL, *bind_ip = NULL, *peer_ip = NULL, *local = NULL, *reply_arg = NULL, *fec_arg = NULL;
+  const char *gso_arg = "on";
   int port = 53;
   for (int i = 1; i + 1 < argc; i += 2) {
     if (!strcmp(argv[i], "--facade")) facade = argv[i + 1];
@@ -367,9 +444,11 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--port")) port = atoi(argv[i + 1]);
     else if (!strcmp(argv[i], "--itype")) itype = atoi(argv[i + 1]);
     else if (!strcmp(argv[i], "--fec")) fec_arg = argv[i + 1];
+    else if (!strcmp(argv[i], "--gso")) gso_arg = argv[i + 1];
   }
-  if (!facade || !bind_ip || !peer_ip || !local || (strcmp(facade, "dns") && strcmp(facade, "icmp"))) {
-    fprintf(stderr, "usage: %s --facade dns|icmp --bind IP --peer IP --local IP:PORT [--reply IP:PORT] [--port 53] [--itype 0] [--fec K:M]\n", argv[0]);
+  if (!facade || !bind_ip || !peer_ip || !local || (strcmp(facade, "dns") && strcmp(facade, "icmp")) ||
+      (strcmp(gso_arg, "on") && strcmp(gso_arg, "off"))) {
+    fprintf(stderr, "usage: %s --facade dns|icmp --bind IP --peer IP --local IP:PORT [--reply IP:PORT] [--port 53] [--itype 0] [--fec K:M] [--gso on|off]\n", argv[0]);
     return 1;
   }
   if (fec_arg && (sscanf(fec_arg, "%d:%d", &fec_k, &fec_m) != 2 || fec_k < 1 || fec_k > KMAX || fec_m < 1 || fec_m > MMAX)) {
@@ -380,6 +459,11 @@ int main(int argc, char **argv) {
   // a random first block number, so the peer cannot mistake a restarted sender's blocks for old ones
   if (getrandom(&enc.id, sizeof enc.id, 0) != sizeof enc.id) enc.id = (uint32_t)now_ms();
   is_dns = !strcmp(facade, "dns");
+  use_gso = is_dns && !strcmp(gso_arg, "on");
+  // stop on SIGTERM/SIGINT after printing the counters (without SA_RESTART, so poll returns at once)
+  struct sigaction sa = {.sa_handler = on_stop};
+  sigaction(SIGTERM, &sa, NULL);
+  sigaction(SIGINT, &sa, NULL);
   char lip[64];
   snprintf(lip, sizeof lip, "%s", local);
   char *colon = strrchr(lip, ':');
@@ -415,7 +499,8 @@ int main(int argc, char **argv) {
   }
   time_t next = time(NULL) + 60;
   struct pollfd pf[2] = {{loc, POLLIN, 0}, {rx, POLLIN, 0}};
-  printf("golden-gre-relay up: %s %s <-> %s, local %s, fec %s\n", facade, bind_ip, peer_ip, local, fec_arg ? fec_arg : "off");
+  printf("golden-gre-relay up: %s %s <-> %s, local %s, fec %s, gso %s\n", facade, bind_ip, peer_ip, local,
+         fec_arg ? fec_arg : "off", use_gso ? "on" : "off");
   fflush(stdout);
 
   for (;;) {
@@ -468,9 +553,10 @@ int main(int argc, char **argv) {
       }
       local_flush();
     }
-    if (time(NULL) >= next) {
-      printf("tx=%lu rx=%lu bad=%lu rebuilt=%lu\n", ntx, nrx, nbad, nrebuilt);
+    if (stopping || time(NULL) >= next) {
+      printf("tx=%lu rx=%lu bad=%lu rebuilt=%lu gso=%lu\n", ntx, nrx, nbad, nrebuilt, ngso);
       fflush(stdout);
+      if (stopping) return 0;
       next += 60;
     }
   }
