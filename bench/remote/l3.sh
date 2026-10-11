@@ -27,7 +27,7 @@ esac
 
 start_relay() {
   if [ "$impl" = c ]; then
-    [ -x $TB/relay-c ] || gcc -O2 -o $TB/relay-c $TB/golden-gre-relay.c || { echo "gcc failed"; exit 1; }
+    [ -x $TB/relay-c ] || gcc -O2 -pthread -o $TB/relay-c $TB/golden-gre-relay.c || { echo "gcc failed"; exit 1; }
     nohup $TB/relay-c --facade $facade --bind $L --peer $R --local 127.0.0.1:$RP > $TB/relay.log 2>&1 &
   else
     nohup python3 $TB/tbrelay.py --facade $facade --bind $L --peer $R --local 127.0.0.1:$RP > $TB/relay.log 2>&1 &

@@ -2,7 +2,8 @@
 // IPv4 path lets through. The tunnel (GRE-in-FOU on loopback) sends its packets to --local; each one is
 // wrapped and sent to the peer's relay, which unwraps it and hands it to its own tunnel: to --reply if
 // given (the tunnel's FOU address), else to the sender of the last local packet, which means nothing
-// reaches the tunnel until the tunnel has sent something. Batches with recvmmsg/sendmmsg.
+// reaches the tunnel until the tunnel has sent something. Batches with recvmmsg/sendmmsg. Each
+// direction runs in its own thread, so a two-core server spreads the relay over both cores.
 //
 // FEC: with --fec K:M the relay follows every K tunnel packets with M Reed-Solomon parity packets (a
 // block that is still short FLUSH_MS after its first packet gets proportionally fewer), so the peer can
@@ -14,7 +15,7 @@
 // sends every frame on its own (it is also switched off by itself where the kernel cannot do it).
 // SIGTERM/SIGINT print the counters and exit.
 //
-//   gcc -O2 -Wall -o golden-gre-relay golden-gre-relay.c
+//   gcc -O2 -Wall -pthread -o golden-gre-relay golden-gre-relay.c
 //   golden-gre-relay --facade dns|icmp --bind <public_ip> --peer <peer_ip> --local <ip:port>
 //                    [--reply <ip:port>] [--port 53] [--itype 0] [--fec K:M] [--gso on|off]
 //
@@ -26,6 +27,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -64,15 +66,22 @@
 
 static const uint8_t QUESTION[16] = {5, 'p', 'r', 'o', 'b', 'e', 4, 't', 'e', 's', 't', 0, 0, 16, 0, 1};
 
-static uint8_t bufs[BATCH][BUF];
-static struct sockaddr_in names[BATCH];
-static struct iovec iov[BATCH];
-static struct mmsghdr msgs[BATCH];
+// receive batches, one per direction: each direction runs in its own thread
+struct batch {
+  uint8_t bufs[BATCH][BUF];
+  struct sockaddr_in names[BATCH];
+  struct iovec iov[BATCH];
+  struct mmsghdr msgs[BATCH];
+};
+static struct batch from_local, from_wire;
 
-static int is_dns, itype, tx, loc;
-static struct sockaddr_in peer, reply;
+static int is_dns, itype, tx, rx, loc;
+static struct sockaddr_in peer;
+static struct sockaddr_in reply;  // where tunnel packets go; the wire -> local thread's own copy
 static unsigned seq;
 static unsigned long ntx, nrx, nbad, nrebuilt;
+#define ADD(v, n) __atomic_add_fetch(&(v), (n), __ATOMIC_RELAXED)  // counters: both threads, the stats line
+#define GET(v) __atomic_load_n(&(v), __ATOMIC_RELAXED)
 
 static void die(const char *what) {
   perror(what);
@@ -151,11 +160,11 @@ static int nw, nl;
 // instead of per frame, which is most of what a relay on a small virtual machine spends its CPU on.
 static int use_gso;
 static unsigned long ngso;
-static volatile sig_atomic_t stopping;
+static int stopping;  // set by the signal handler, read by every thread
 
 static void on_stop(int sig) {
   (void)sig;
-  stopping = 1;
+  __atomic_store_n(&stopping, 1, __ATOMIC_RELAXED);
 }
 
 static void wire_flush(void) {
@@ -165,7 +174,7 @@ static void wire_flush(void) {
   if (!nw) return;
   if (!use_gso) {
     int sent = sendmmsg(tx, wmsg, nw, 0);
-    if (sent > 0) ntx += sent;
+    if (sent > 0) ADD(ntx, sent);
     nw = 0;
     return;
   }
@@ -195,8 +204,8 @@ static void wire_flush(void) {
     int sent = sendmmsg(tx, g + j, ng - j, 0);
     if (sent > 0) {
       for (int k = j; k < j + sent; k++) {
-        ntx += nseg[k];
-        if (nseg[k] > 1) ngso++;
+        ADD(ntx, nseg[k]);
+        if (nseg[k] > 1) ADD(ngso, 1);
       }
       j += sent;
       continue;
@@ -206,7 +215,7 @@ static void wire_flush(void) {
       fflush(stdout);
       use_gso = 0;
       int rest = sendmmsg(tx, wmsg + first[j], nw - first[j], 0);
-      if (rest > 0) ntx += rest;
+      if (rest > 0) ADD(ntx, rest);
     }
     break;  // anything else (a full socket buffer): drop the rest, as a plain send would
   }
@@ -230,7 +239,7 @@ static void wire_emit(const uint8_t *a, size_t alen, const uint8_t *b, size_t bl
 static void local_flush(void) {
   if (!nl) return;
   int sent = sendmmsg(loc, lmsg, nl, 0);
-  if (sent > 0) nrx += sent;
+  if (sent > 0) ADD(nrx, sent);
   nl = 0;
 }
 
@@ -434,7 +443,7 @@ static void fec_rebuild(struct slot *s) {
   for (int c = 0; c < e; c++) {  // Gauss-Jordan: a = [A | I] becomes [I | A^-1]
     int p = c;
     while (p < e && !a[p][c]) p++;
-    if (p == e) { nbad++; return; }
+    if (p == e) { ADD(nbad, 1); return; }
     for (int x = 0; p != c && x < 2 * e; x++) {
       uint8_t t = a[p][x];
       a[p][x] = a[c][x];
@@ -454,21 +463,21 @@ static void fec_rebuild(struct slot *s) {
     for (r = 0; r < e; r++) muladd(d, S[r], a[c][e + r], s->L);
     size_t n = (size_t)d[0] << 8 | d[1];
     s->have[miss[c]] = 1;
-    if (n > s->L - 2) { nbad++; continue; }
+    if (n > s->L - 2) { ADD(nbad, 1); continue; }
     local_emit(d + 2, n);
-    nrebuilt++;
+    ADD(nrebuilt, 1);
   }
   s->done = 1;
 }
 
 static void fec_input(const uint8_t *p, size_t len) {
-  if (len < FEC_HDR) { nbad++; return; }
+  if (len < FEC_HDR) { ADD(nbad, 1); return; }
   uint32_t id = (uint32_t)p[1] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 8 | p[4];
   int idx = p[5], k = p[6], par = idx & 0x80, j = idx & 0x7F;
   const uint8_t *body = p + FEC_HDR;
   size_t blen = len - FEC_HDR;
   if (par ? j >= MMAX || k < 1 || k > KMAX || blen < 2 || blen > 2 + MAXPAY : idx >= KMAX || blen > MAXPAY) {
-    nbad++;
+    ADD(nbad, 1);
     return;
   }
   struct slot *s = &slots[id % NSLOT];
@@ -489,7 +498,7 @@ static void fec_input(const uint8_t *p, size_t len) {
   int at = par ? KMAX + j : idx;
   if (s->have[at]) return;  // a duplicate, or a packet already rebuilt
   if (par) {
-    if (s->k && (s->k != k || s->L != blen)) { nbad++; return; }
+    if (s->k && (s->k != k || s->L != blen)) { ADD(nbad, 1); return; }
     s->k = k;
     s->L = blen;
     s->np++;
@@ -504,6 +513,103 @@ static void fec_input(const uint8_t *p, size_t len) {
     if (s->nd >= s->k) s->done = 1;
     else if (s->nd + s->np >= s->k) fec_rebuild(s);
   }
+}
+
+// --- the two directions, one thread each. They share only where tunnel packets go (learned from the
+// tunnel's own packets unless --reply fixed it) and the counters, so they run on two cores in parallel.
+
+static pthread_mutex_t reply_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct sockaddr_in reply_shared;
+static int reply_known;
+
+static void set_reply(const struct sockaddr_in *a) {
+  pthread_mutex_lock(&reply_mu);
+  reply_shared = *a;
+  reply_known = 1;
+  pthread_mutex_unlock(&reply_mu);
+}
+
+static int get_reply(struct sockaddr_in *a) {
+  pthread_mutex_lock(&reply_mu);
+  int known = reply_known;
+  if (known) *a = reply_shared;
+  pthread_mutex_unlock(&reply_mu);
+  return known;
+}
+
+static void recv_setup(struct batch *b, size_t room) {
+  for (int i = 0; i < BATCH; i++) {
+    b->iov[i] = (struct iovec){b->bufs[i], room};
+    b->msgs[i].msg_hdr = (struct msghdr){.msg_name = &b->names[i], .msg_namelen = sizeof b->names[i], .msg_iov = &b->iov[i], .msg_iovlen = 1};
+  }
+}
+
+static void *local_to_wire(void *arg) {  // tunnel packets -> FEC -> facade -> peer
+  struct batch *b = &from_local;
+  struct sockaddr_in last = {0};
+  struct pollfd pf = {loc, POLLIN, 0};
+  (void)arg;
+  while (!GET(stopping)) {
+    int wait = 1000;
+    if (enc.k) {
+      uint64_t age = now_ms() - enc.start;
+      wait = age >= FLUSH_MS ? 0 : (int)(FLUSH_MS - age);
+    }
+    if (poll(&pf, 1, wait) > 0 && (pf.revents & POLLIN)) {
+      recv_setup(b, MAXPAY);
+      int n = recvmmsg(loc, b->msgs, BATCH, MSG_DONTWAIT, NULL);
+      for (int i = 0; i < n; i++) {
+        if (memcmp(&b->names[i], &last, sizeof last)) {  // the tunnel's address: tell the other direction
+          last = b->names[i];
+          set_reply(&last);
+        }
+        if (b->msgs[i].msg_hdr.msg_flags & MSG_TRUNC) { ADD(nbad, 1); continue; }
+        send_tunnel_packet(b->bufs[i], b->msgs[i].msg_len);
+      }
+      wire_flush();
+    }
+    if (enc.k && now_ms() - enc.start >= FLUSH_MS) {
+      fec_flush();
+      wire_flush();
+    }
+  }
+  return NULL;
+}
+
+static void *wire_to_local(void *arg) {  // peer -> facade -> FEC -> tunnel
+  struct batch *b = &from_wire;
+  struct pollfd pf = {rx, POLLIN, 0};
+  (void)arg;
+  while (!GET(stopping)) {
+    if (poll(&pf, 1, 1000) <= 0 || !(pf.revents & POLLIN)) continue;
+    recv_setup(b, BUF);
+    int n = recvmmsg(rx, b->msgs, BATCH, MSG_DONTWAIT, NULL);
+    if (n <= 0 || !get_reply(&reply)) continue;  // nothing reaches the tunnel before its address is known
+    for (int i = 0; i < n; i++) {
+      uint8_t *p = b->bufs[i];
+      size_t len = b->msgs[i].msg_len;
+      if (b->names[i].sin_addr.s_addr != peer.sin_addr.s_addr) continue;
+      if (is_dns) {
+        if (len <= DNS_HDR || memcmp(p + 12, QUESTION, sizeof QUESTION)) { ADD(nbad, 1); continue; }
+        p += DNS_HDR;
+        len -= DNS_HDR;
+      } else {
+        size_t ihl = (p[0] & 15) * 4;
+        if (len <= ihl + ICMP_HDR || p[ihl] != itype || ((p[ihl + 4] << 8) | p[ihl + 5]) != IDENT) { ADD(nbad, 1); continue; }
+        p += ihl + ICMP_HDR;
+        len -= ihl + ICMP_HDR;
+      }
+      if (p[0] == FEC_MAGIC) fec_input(p, len);
+      else local_emit(p, len);
+    }
+    local_flush();
+  }
+  return NULL;
+}
+
+static void print_counters(void) {
+  printf("tx=%lu rx=%lu bad=%lu rebuilt=%lu gso=%lu\n", GET(ntx), GET(nrx), GET(nbad), GET(nrebuilt), GET(ngso));
+  fflush(stdout);
 }
 
 int main(int argc, char **argv) {
@@ -547,7 +653,6 @@ int main(int argc, char **argv) {
   *colon = 0;
 
   loc = udp_socket(mkaddr(lip, atoi(colon + 1)));
-  int rx;
   if (is_dns) {
     rx = udp_socket(mkaddr(bind_ip, port));
     tx = udp_socket(mkaddr(bind_ip, 0));
@@ -563,77 +668,34 @@ int main(int argc, char **argv) {
     peer = mkaddr(peer_ip, 0);
   }
 
-  int have_reply = 0;
   if (reply_arg) {
     char rip[64];
     snprintf(rip, sizeof rip, "%s", reply_arg);
     char *rcolon = strrchr(rip, ':');
     if (!rcolon) die("--reply needs ip:port");
     *rcolon = 0;
-    reply = mkaddr(rip, atoi(rcolon + 1));
-    have_reply = 1;
+    struct sockaddr_in r = mkaddr(rip, atoi(rcolon + 1));
+    set_reply(&r);
   }
-  time_t next = time(NULL) + 60;
-  struct pollfd pf[2] = {{loc, POLLIN, 0}, {rx, POLLIN, 0}};
   printf("golden-gre-relay up: %s %s <-> %s, local %s, fec %s, gso %s, gf %s\n", facade, bind_ip, peer_ip, local,
          fec_arg ? fec_arg : "off", use_gso ? "on" : "off", gf_impl);
   fflush(stdout);
 
-  for (;;) {
-    int wait = 1000;
-    if (enc.k) {
-      uint64_t age = now_ms() - enc.start;
-      wait = age >= FLUSH_MS ? 0 : (int)(FLUSH_MS - age);
-    }
-    poll(pf, 2, wait);
-    if (pf[0].revents & POLLIN) {  // local tunnel endpoint -> wire
-      for (int i = 0; i < BATCH; i++) {
-        iov[i] = (struct iovec){bufs[i], MAXPAY};
-        msgs[i].msg_hdr = (struct msghdr){.msg_name = &names[i], .msg_namelen = sizeof names[i], .msg_iov = &iov[i], .msg_iovlen = 1};
-      }
-      int n = recvmmsg(loc, msgs, BATCH, MSG_DONTWAIT, NULL);
-      for (int i = 0; i < n; i++) {
-        reply = names[i];
-        have_reply = 1;
-        if (msgs[i].msg_hdr.msg_flags & MSG_TRUNC) { nbad++; continue; }
-        send_tunnel_packet(bufs[i], msgs[i].msg_len);
-      }
-      wire_flush();
-    }
-    if (enc.k && now_ms() - enc.start >= FLUSH_MS) {
-      fec_flush();
-      wire_flush();
-    }
-    if (pf[1].revents & POLLIN) {  // wire -> local tunnel endpoint
-      for (int i = 0; i < BATCH; i++) {
-        iov[i] = (struct iovec){bufs[i], BUF};
-        msgs[i].msg_hdr = (struct msghdr){.msg_name = &names[i], .msg_namelen = sizeof names[i], .msg_iov = &iov[i], .msg_iovlen = 1};
-      }
-      int n = recvmmsg(rx, msgs, BATCH, MSG_DONTWAIT, NULL);
-      for (int i = 0; i < n && have_reply; i++) {
-        uint8_t *p = bufs[i];
-        size_t len = msgs[i].msg_len;
-        if (names[i].sin_addr.s_addr != peer.sin_addr.s_addr) continue;
-        if (is_dns) {
-          if (len <= DNS_HDR || memcmp(p + 12, QUESTION, sizeof QUESTION)) { nbad++; continue; }
-          p += DNS_HDR;
-          len -= DNS_HDR;
-        } else {
-          size_t ihl = (p[0] & 15) * 4;
-          if (len <= ihl + ICMP_HDR || p[ihl] != itype || ((p[ihl + 4] << 8) | p[ihl + 5]) != IDENT) { nbad++; continue; }
-          p += ihl + ICMP_HDR;
-          len -= ihl + ICMP_HDR;
-        }
-        if (p[0] == FEC_MAGIC) fec_input(p, len);
-        else local_emit(p, len);
-      }
-      local_flush();
-    }
-    if (stopping || time(NULL) >= next) {
-      printf("tx=%lu rx=%lu bad=%lu rebuilt=%lu gso=%lu\n", ntx, nrx, nbad, nrebuilt, ngso);
-      fflush(stdout);
-      if (stopping) return 0;
+  pthread_t out_thread, in_thread;
+  if ((errno = pthread_create(&out_thread, NULL, local_to_wire, NULL)) ||
+      (errno = pthread_create(&in_thread, NULL, wire_to_local, NULL)))
+    die("pthread_create");
+  pthread_setname_np(out_thread, "relay-out");
+  pthread_setname_np(in_thread, "relay-in");
+  for (time_t next = time(NULL) + 60; !GET(stopping);) {
+    sleep(1);
+    if (time(NULL) >= next) {
+      print_counters();
       next += 60;
     }
   }
+  pthread_join(out_thread, NULL);
+  pthread_join(in_thread, NULL);
+  print_counters();
+  return 0;
 }

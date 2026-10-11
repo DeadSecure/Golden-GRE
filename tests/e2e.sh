@@ -28,7 +28,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-gcc -O2 -Wall -o "$tmp/relay" relay/golden-gre-relay.c
+gcc -O2 -Wall -pthread -o "$tmp/relay" relay/golden-gre-relay.c
 export GOLDEN_GRE_RELAY="$tmp/relay"
 
 start_relay() { # namespace instance -> background relay, pid in $RELAY_PID
