@@ -350,14 +350,23 @@ Some paths drop packets in one direction only, at every rate and on every port (
 
 Measured on that path (TR → IR, about 10% raw loss at the time, residual loss counted by unique sequence numbers):
 
-| `FEC` | Loss left | Wire overhead | Relay CPU on the 2-vCPU sender at ~75 Mbit/s |
-|-------|-----------|---------------|------|
-| off | 7–10% | — | low |
-| `1:1` (duplication) | 2.6% | 100% | low |
-| `4:2` | 2.5% | 50% | ~25% of a core |
-| `10:5` | 0.9% | 50% | ~57% of a core |
+| `FEC` | Loss left | Wire overhead |
+|-------|-----------|---------------|
+| off | 7–10% | — |
+| `1:1` (duplication) | 2.6% | 100% |
+| `4:2` | 2.5% | 50% |
+| `10:5` | 0.9% | 50% |
 
-Bigger blocks repair more per byte of overhead but deliver a rebuilt packet later, after the rest of its block. Two caveats from the same measurements:
+On a lossier evening, single TCP downloads through the relay (2-vCPU sender, AVX2 encoder, UDP GSO):
+
+| `FEC` | 1 flow | 4 flows | Sender relay CPU |
+|-------|--------|---------|------------------|
+| off | 7 Mbit/s | 30 Mbit/s | 31% of a core |
+| `10:3` | 7 | 28 | 31% |
+| `10:5` | 250–288 | 257 | 87% |
+| `20:10` | 242–250 | 242 | 82% |
+
+Too little parity does nothing (`10:3` that evening); enough parity turns a collapsed path into the full rate. At the same overhead, bigger blocks repair more (at 22% loss, `20:10` leaves an estimated 1.8% of packets lost against 3.5% for `10:5`) but deliver a rebuilt packet later, after the rest of its block — under 1 ms at these rates. The encoder multiplies 32 bytes per step with AVX2 (16 with SSSE3, a table elsewhere; the start line says which), so FEC costs about 0.1 µs per packet. Two caveats:
 
 - **FEC fixes loss, not every slow path.** When loss is the limit (single flows at 6–13 Mbit/s), redundancy multiplied throughput by 4–7×. On a day when the path was faster (40 ms, ~10% loss), TCP ran at 60–90 Mbit/s with or without FEC, because something other than loss capped it.
 - **iperf3's UDP loss figure over-counts with FEC:** it counts rebuilt packets, which arrive out of order, as lost. Count unique sequence numbers instead.
