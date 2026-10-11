@@ -342,6 +342,30 @@ Everything a test creates lives under `/tmp/tb` on the servers (device `tb0`, ov
 
 ---
 
+## 🧯 Lossy paths (FEC)
+
+Some paths drop packets in one direction only, at every rate and on every port (the measured one: 7–22% into Iran, ~0% out, changing over the day). TCP sent into that loss retransmits and backs off; with no repair, a single download through the relay fell to 6–13 Mbit/s while uploads ran at 200.
+
+`FEC=K:M` makes this end's relay follow every K packets with M Reed-Solomon parity packets; the peer rebuilds up to M lost packets per block as soon as enough of the block has arrived, without a round trip. Set it on the end that **sends into** the lossy direction; the other end decodes without any setting (update it first, older relays do not understand FEC frames). A block that is still short 5 ms after its first packet gets proportionally fewer parity packets, so idle and interactive traffic is not padded.
+
+Measured on that path (TR → IR, about 10% raw loss at the time, residual loss counted by unique sequence numbers):
+
+| `FEC` | Loss left | Wire overhead | Relay CPU on the 2-vCPU sender at ~75 Mbit/s |
+|-------|-----------|---------------|------|
+| off | 7–10% | — | low |
+| `1:1` (duplication) | 2.6% | 100% | low |
+| `4:2` | 2.5% | 50% | ~25% of a core |
+| `10:5` | 0.9% | 50% | ~57% of a core |
+
+Bigger blocks repair more per byte of overhead but deliver a rebuilt packet later, after the rest of its block. Two caveats from the same measurements:
+
+- **FEC fixes loss, not every slow path.** When loss is the limit (single flows at 6–13 Mbit/s), redundancy multiplied throughput by 4–7×. On a day when the path was faster (40 ms, ~10% loss), TCP ran at 60–90 Mbit/s with or without FEC, because something other than loss capped it.
+- **iperf3's UDP loss figure over-counts with FEC:** it counts rebuilt packets, which arrive out of order, as lost. Count unique sequence numbers instead.
+
+The relay logs `rebuilt=` every minute next to `tx`/`rx`; if it stays flat while the path loses packets, the peer is not decoding.
+
+---
+
 ## 🩺 Troubleshooting
 
 | Symptom | Likely cause | Check / fix |
