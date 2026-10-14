@@ -16,7 +16,7 @@
 
 <h3 align="center">🥇 GRE tunnels for IPv4 paths that cut tunnels — GRE rides inside a relay that makes it look like ping replies or DNS queries, so it passes where GRE, WireGuard, QUIC and TCP tunnels are cut.</h3>
 
-<p align="center"><i>A real <code>greN</code> L3 interface between Linux servers, tuned for loss, managed by systemd, measured at 500–690 Mbit/s Iran–Germany and 140–160 Mbit/s Iran–Turkey, on paths that kill every ordinary tunnel.</i></p>
+<p align="center"><i>A real <code>greN</code> L3 interface between Linux servers, tuned for loss, managed by systemd, measured at 500–690 Mbit/s Iran–Germany and 140–160 Mbit/s Iran–Kharej, on paths that kill every ordinary tunnel.</i></p>
 
 ---
 
@@ -28,7 +28,7 @@ Some IPv4 paths between countries do not just drop GRE (IP protocol 47). They **
 
 On top of transport it ships the **production glue** a raw `ip tunnel` command leaves out:
 
-- 🥇 **Passes where native tunnels are cut** — Iran–Germany with the ICMP disguise: 512–558 Mbit/s up, 520–691 down, ~606 averaged over a 60-second download. Iran–Turkey with the DNS disguise: 138 Mbit/s down / 153 up / 161 with four flows, 144 Mbit/s over a 5-minute soak, on a path where plain GRE, FOU, GUE, IPIP, VXLAN, Geneve and WireGuard carried nothing.
+- 🥇 **Passes where native tunnels are cut** — Iran–Germany with the ICMP disguise: 512–558 Mbit/s up, 520–691 down, ~606 averaged over a 60-second download. Iran–Kharej with the DNS disguise: 138 Mbit/s down / 153 up / 161 with four flows, 144 Mbit/s over a 5-minute soak, on a path where plain GRE, FOU, GUE, IPIP, VXLAN, Geneve and WireGuard carried nothing.
 - ⚡ **One-line setup** — [`golden-gre.sh`](#-easy-install-one-line) installs everything and builds a tunnel from just the two servers' IPs; a menu manages it afterwards.
 - ⚡ **Loss-tolerant by default** — BBR congestion control + `fq`, so a lossy long-haul path doesn't collapse TCP (CUBIC halves its window on every loss; BBR doesn't).
 - 🧱 **Forwarding-ready** — `ip_forward`, a FORWARD accept inserted ahead of Docker/ufw's DROP policy, and **TCP MSS clamping** so forwarded TCP never blackholes on PMTUD.
@@ -69,7 +69,7 @@ The **ICMP facade** (`FACADE=icmp`) sends the same datagrams as unsolicited ICMP
 
 | Path | `dns` | `icmp` |
 |------|-------|--------|
-| Iran–Turkey ([docs/FILTER.md](docs/FILTER.md)) | passes, 140–160 Mbit/s | passes, but reorders heavily at higher rates and is slower |
+| Iran–Kharej ([docs/FILTER.md](docs/FILTER.md)) | passes, 140–160 Mbit/s | passes, but reorders heavily at higher rates and is slower |
 | Iran–Germany (Hetzner) | **cut after 6 packets per flow** | passes, 500–690 Mbit/s, 0% ping loss |
 
 The [one-line setup](#-easy-install-one-line) defaults to `icmp`; the relay itself, and configs without `FACADE`, default to `dns`.
@@ -105,7 +105,7 @@ It installs what is missing (`gcc`, `iptables`, `ethtool`, …), builds Golden G
 
 After that, `golden-gre` opens the menu: new tunnel, manage tunnels (status with a live ping, start/stop/restart, FEC on/off, disguise DNS/ICMP, delete), live logs, update, uninstall.
 
-Setup defaults to the ICMP disguise: it passed on every path measured so far, while the DNS disguise was cut after 6 packets per flow on an Iran–Germany path (where ICMP carried 500–690 Mbit/s). On the Iran–Turkey path in [docs/FILTER.md](docs/FILTER.md) both passed and DNS was faster. If the ping through the tunnel stops after a few packets, or never answers, switch **both** servers to the other disguise in **Manage tunnels → Disguise**.
+Setup defaults to the ICMP disguise: it passed on every path measured so far, while the DNS disguise was cut after 6 packets per flow on an Iran–Germany path (where ICMP carried 500–690 Mbit/s). On the Iran–Kharej path in [docs/FILTER.md](docs/FILTER.md) both passed and DNS was faster. If the ping through the tunnel stops after a few packets, or never answers, switch **both** servers to the other disguise in **Manage tunnels → Disguise**.
 
 Setup writes `MTU=1380`, which fits any path. If `ping -M do -s 1472 <peer IP>` answers in both directions, the path carries full 1500-byte packets: add `MTU=1464` (ICMP) or `MTU=1425` (DNS) to `/etc/golden-gre/<peer IP>.conf` on both servers and restart the tunnel. On Iran–Germany that took upload from 512 to 558 Mbit/s.
 
