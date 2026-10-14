@@ -26,7 +26,7 @@ pair_params "$S2" "$S1" "$S1"
 [ "$PAIR_KEY $PAIR_ADDR $PAIR_PEER" = "$key1 $addr1 $peer1" ] || fail "typing the IPs in the other order changed this end's settings"
 pair_params "$S1" "$S2" "$S2"; key2=$PAIR_KEY addr2=$PAIR_ADDR peer2=$PAIR_PEER
 [ "$key1" = "$key2" ] || fail "the two ends derive different GRE keys ($key1, $key2)"
-[ "${addr1%/*}" = "$peer2" ] && [ "${addr2%/*}" = "$peer1" ] || fail "overlay addresses do not pair up: $addr1/$peer1 vs $addr2/$peer2"
+if ! { [ "${addr1%/*}" = "$peer2" ] && [ "${addr2%/*}" = "$peer1" ]; }; then fail "overlay addresses do not pair up: $addr1/$peer1 vs $addr2/$peer2"; fi
 [ "$(peer_of "$addr1")" = "$peer1" ] || fail "peer_of $addr1 gave $(peer_of "$addr1"), want $peer1"
 case "$addr2" in 10.99.*/30) ;; *) fail "overlay $addr2 is not a /30 in 10.99.0.0/16" ;; esac
 last=${addr2%/*}; last=${last##*.}
@@ -77,7 +77,7 @@ printf '192.0.2.1\n192.0.2.2\ny\n' | run_setup "$A" >"$tmp/a.out" 2>&1 || { cat 
 printf '192.0.2.2\n192.0.2.1\nn\n' | run_setup "$B" >"$tmp/b.out" 2>&1 || { cat "$tmp/b.out"; fail "setup failed on server 2"; }
 
 confA="/etc/netns/$A/golden-gre/192.0.2.2.conf" confB="/etc/netns/$B/golden-gre/192.0.2.1.conf"
-[ -r "$confA" ] && [ -r "$confB" ] || fail "setup did not write the configs (want $confA and $confB)"
+if ! { [ -r "$confA" ] && [ -r "$confB" ]; }; then fail "setup did not write the configs (want $confA and $confB)"; fi
 grep -qx 'FEC=10:5' "$confA" || fail "FEC=yes on server 1 did not write FEC=10:5"
 if grep -q '^FEC=' "$confB"; then fail "FEC=no on server 2 still wrote FEC"; fi
 [ "$(grep '^GRE_KEY=' "$confA")" = "$(grep '^GRE_KEY=' "$confB")" ] || fail "the two configs have different GRE keys"
