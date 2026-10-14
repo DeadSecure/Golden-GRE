@@ -15,14 +15,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: ShellCheck
-        run: shellcheck -x scripts/*.sh tests/*.sh install.sh bench/*.sh bench/remote/*.sh tools/*.sh
+        run: shellcheck -x golden-gre.sh scripts/*.sh tests/*.sh install.sh bench/*.sh bench/remote/*.sh tools/*.sh
       - name: Python compiles
         run: python3 -m py_compile bench/remote/*.py
       - name: relay builds without warnings
         run: gcc -O2 -Wall -Wextra -Werror -pthread -o /tmp/golden-gre-relay relay/golden-gre-relay.c
       - name: scripts are executable & have bash shebang
         run: |
-          for s in scripts/*.sh tests/*.sh install.sh; do
+          for s in golden-gre.sh scripts/*.sh tests/*.sh install.sh; do
             head -1 "$s" | grep -q '^#!/usr/bin/env bash' || { echo "bad shebang: $s"; exit 1; }
             # README tells users to run ./install.sh directly, so the committed
             # mode has to carry +x — a shebang alone does not make it runnable.
@@ -52,3 +52,5 @@ jobs:
         run: sudo tests/e2e.sh
       - name: systemd wiring — relay is the main process, check timer follows the tunnel
         run: sudo tests/systemd.sh
+      - name: easy manager — both ends agree, setup builds a tunnel, then the menu under systemd (uninstalls, so last)
+        run: sudo GOLDEN_GRE_TEST_UNINSTALL=1 tests/manager.sh

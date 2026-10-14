@@ -85,9 +85,30 @@ modprobe fou && modprobe ip_gre && echo "ready"
 
 ---
 
+## ⚡ Easy install (one line)
+
+Run this on **both** servers, as root:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/LivingG0D/Golden-GRE/main/golden-gre.sh)
+```
+
+It installs what is missing (`gcc`, `iptables`, `ethtool`, …), builds Golden GRE, and asks three things: **server 1's IP, server 2's IP**, and whether to turn on [FEC](#-lossy-paths-fec) on this server. Type the same two IPs on both servers, in any order. The script works out which end it is on and gives both ends the same GRE key and /30 tunnel subnet, so nothing else has to match by hand. When the second server is done, it pings the first through the tunnel.
+
+After that, `golden-gre` opens the menu: new tunnel, manage tunnels (status with a live ping, start/stop/restart, FEC on/off, delete), live logs, update, uninstall.
+
+- Run it as `bash <(…)`, not `curl … | bash`: the menu reads your answers from the terminal.
+- Not logged in as root? Run `sudo -i` first. `sudo bash <(…)` does not work: sudo closes the pipe the script comes through.
+- Behind 1:1 NAT (AWS, GCP, Oracle, …)? Type the **public** IPs. The script notices that neither one is on the server and asks which server it is on. Allow inbound UDP 53 from the other server in the provider's firewall.
+- Both servers print a **pair check** (GRE key and subnet). If the tunnel doesn't come up, compare the two: they must match.
+- No access to GitHub from the server? `git clone` the repo on a machine that has access, copy it over, and run `sudo ./golden-gre.sh` inside it.
+- Setup names each tunnel after its peer (`golden-gre@<peer IP>`, config `/etc/golden-gre/<peer IP>.conf`), so everything below applies to it too.
+
+---
+
 ## 🚀 Quick start
 
-A two-server, point-to-point tunnel.
+A two-server, point-to-point tunnel, by hand.
 
 ```bash
 # --- on BOTH servers ---
@@ -147,6 +168,8 @@ That's a reboot-persistent, loss-tolerant, forwarding-ready tunnel. 🥇
 | `/etc/golden-gre/` | `0750` | Directory for your per-tunnel configs (created empty) |
 
 No packages are installed, no existing network configuration is rewritten, and no tunnel starts until you create a config and enable an instance.
+
+The [one-line installer](#-easy-install-one-line) (`golden-gre.sh`) is different: it installs missing packages with apt/dnf, runs `install.sh`, and adds itself as `/usr/local/bin/golden-gre`. Its **Uninstall** removes every path in the table above, the tunnels' units, and that command, and asks before it deletes `/etc/golden-gre/`.
 
 > ⚠️ **Upgrading a host that runs tunnels from an older Golden GRE** (direct GRE-in-UDP or an IPv6 underlay): the new `golden-gre@.service` has a different shape, and `golden-gre-up.sh` rejects IPv6 endpoints and the old keys. Do not run `install.sh` over live tunnels of the old kind; stop them first and convert each config (see the keys below).
 
