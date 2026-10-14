@@ -314,10 +314,14 @@ fwd_range() { # entry -> FWD_LO FWD_HI; status 1 when it is not a valid entry
 valid_forward() { # entry: well formed and not over port 22 (golden-gre-up.sh refuses that too)
   fwd_range "$1" && (( FWD_LO > 22 || FWD_HI < 22 ))
 }
+fwd_list() { # name -> FORWARD entries, space-separated (a hand-edited config may use commas)
+  local v
+  v=$(conf_get "$1" FORWARD | tr ',' ' ' | tr -s ' '); v=${v# }; echo "${v% }"
+}
 set_forward() { # name "entries" — write FORWARD; restart a running tunnel so the rules follow
   local conf="$CONF_DIR/$1.conf" v cur
-  v=$(tr -s ' ' <<<" $2 "); v=${v# }; v=${v% }
-  cur=$(conf_get "$1" FORWARD)
+  v=$(tr -s ' ' <<<" ${2//,/ } "); v=${v# }; v=${v% }   # saved space-separated
+  cur=$(fwd_list "$1")
   if [ "$v" = "$cur" ]; then say "No change."; return 0; fi
   if [ -n "$v" ] && [ -z "$(conf_get "$1" PEER_ADDR)" ]; then
     case "$(conf_get "$1" TUN_ADDR)" in
@@ -338,7 +342,7 @@ fwd_overlap() { # entry "entries" -> the first listed entry whose ports on this 
   local -a list
   fwd_range "$1" || return 1
   lo=$FWD_LO hi=$FWD_HI
-  read -ra list <<<"$2"
+  read -ra list <<<"${2//,/ }"
   for x in ${list[@]+"${list[@]}"}; do
     fwd_range "$x" || continue
     if (( FWD_LO <= hi && lo <= FWD_HI )); then echo "$x"; return 0; fi
@@ -348,12 +352,12 @@ fwd_overlap() { # entry "entries" -> the first listed entry whose ports on this 
 add_forwards() { # name
   local n=$1 cur e p ok dev lp relay='' add='' other
   local -a in=() ssh_ports=() listening=()
-  cur=$(conf_get "$n" FORWARD) lp=$(conf_get "$n" LOCAL_PUB)
+  cur=$(fwd_list "$n") lp=$(conf_get "$n" LOCAL_PUB)
   # The dns facade's own relay listens on LOCAL_PUB:DNS_PORT; the peer's traffic is never forwarded, so it stays.
   [ "$(conf_get "$n" FACADE dns)" = icmp ] || relay=$(conf_get "$n" DNS_PORT 53)
-  say "Examples: 443   2053:2096 (a range)   8080=80 (this server's 8080 to the peer's 80). Each is TCP and UDP."
+  say "Separate ports with commas or spaces: 443,1080,2087. Also 2053:2096 (a range) and 8080=80 (this server's 8080 to the peer's 80). Each is TCP and UDP."
   ask "Ports to add: "
-  read -ra in <<<"$REPLY"
+  read -ra in <<<"${REPLY//,/ }"
   mapfile -t ssh_ports < <({ echo 22; sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }'; } | sort -un)
   # Only listeners the forwarding takes over: on LOCAL_PUB or on every address.
   mapfile -t listening < <(ss -Hltun 2>/dev/null | awk -v lp="$lp" -v relay="$relay" '{
@@ -392,11 +396,11 @@ add_forwards() { # name
 remove_forwards() { # name
   local n=$1 cur e keep=''
   local -a list=()
-  cur=$(conf_get "$n" FORWARD)
+  cur=$(fwd_list "$n")
   [ -n "$cur" ] || { say "No forwarded ports."; return 0; }
   ask "Ports to remove, exactly as listed ($cur): "
   read -ra list <<<"$cur"
-  for e in ${list[@]+"${list[@]}"}; do [[ " $REPLY " == *" $e "* ]] || keep+=" $e"; done
+  for e in ${list[@]+"${list[@]}"}; do [[ " ${REPLY//,/ } " == *" $e "* ]] || keep+=" $e"; done
   if [ "${keep# }" = "$cur" ]; then say "Nothing matched: type entries exactly as listed."; return 0; fi
   set_forward "$n" "$keep"
 }

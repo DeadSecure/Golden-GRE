@@ -103,7 +103,7 @@ One file per tunnel, `/etc/golden-gre/<name>.conf`:
 | `MTU` | `1380` | If the path carries 1500-byte packets (`ping -M do -s 1472 <peer>` answers), use `1464` for icmp or `1425` for dns. |
 | `GRE_KEY` | `41` | Same on both ends; different per tunnel on a host. |
 | `FEC` | off | `K:M`: M parity packets per K on what this end sends. |
-| `FORWARD` | none | Ports to forward to the peer: `"443 2053:2096 8080=80"`. |
+| `FORWARD` | none | Ports to forward to the peer, comma- or space-separated: `"443,1080,2053:2096,8080=80"`. |
 | `ROUTES` | none | CIDRs to route via the tunnel. |
 | `NAT_SRC` / `NAT_OUT` | none | MASQUERADE this source out an interface (use the node as an exit). |
 | `FOU_PORT` / `RELAY_PORT` | `5599` / `5601` | Loopback ports, unique per tunnel on a host. |
@@ -128,7 +128,7 @@ systemctl enable golden-gre-check@link.timer   # ping the peer every minute; a d
 Clients connect to the Iran server's public IP; the service runs on the Kharej server. On the Iran server: **Manage tunnels → tunnel → Port forwarding → Add ports**, or in its config:
 
 ```bash
-FORWARD="443 2053:2096 8080=80"   # 443 -> peer 443, a range -> same ports, 8080 -> peer 80; TCP and UDP
+FORWARD="443,1080,2087,2053:2096,8080=80"   # same ports on the peer, a range, 8080 -> peer 80; TCP and UDP
 ```
 
 It is kernel NAT (a DNAT per entry plus a MASQUERADE on the tunnel), so it adds no CPU beyond the tunnel. The rules follow the tunnel and are removed on stop.

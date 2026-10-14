@@ -50,7 +50,7 @@ if [ -n "${FORWARD:-}" ]; then
       *) echo "golden-gre: set PEER_ADDR in $CONF to use FORWARD (TUN_ADDR is not a /30 or /31)" >&2; exit 1 ;;
     esac
   fi
-  read -ra _fwd <<<"${FORWARD}"
+  read -ra _fwd <<<"${FORWARD//,/ }"   # commas or spaces separate entries
   for e in ${_fwd[@]+"${_fwd[@]}"}; do
     if [[ $e =~ ^([0-9]{1,5})(:([0-9]{1,5}))?$ ]]; then
       lo=$(( 10#${BASH_REMATCH[1]} )) hi=$(( 10#${BASH_REMATCH[3]:-${BASH_REMATCH[1]}} )) to=''

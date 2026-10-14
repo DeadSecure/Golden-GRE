@@ -135,7 +135,8 @@ s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("10.99.99.2", 9000
 while True:
     d, a = s.recvfrom(2048); s.sendto(b"echo:" + d, a)' >/dev/null 2>&1 &
 pids+=("$!")
-echo 'FORWARD="8080=8000 8000 9000:9001"' >>"/etc/golden-gre/$CA.conf"
+# Commas, with and without a space, separate entries too.
+echo 'FORWARD="8080=8000,8000, 9000:9001"' >>"/etc/golden-gre/$CA.conf"
 ip netns exec "$A" "$UP" "$CA" >/dev/null
 ip netns exec "$A" "$UP" "$CA" >/dev/null   # a re-run must not duplicate the rules
 fwd="$(ip netns exec "$A" iptables-save -t nat | grep -F "golden-gre-fwd:$CA" || true)"

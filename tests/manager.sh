@@ -26,6 +26,13 @@ for bad in 0 65536 22 "20:30" "90:80" "8080=0" "8080=" abc "443 " "1-2"; do
 done
 ok "forward entry validation (port 22 and ranges over it refused)"
 
+# Commas separate entries too: 443,1080,2087 (hand-edited configs included).
+CONF_DIR_SAVED=$CONF_DIR CONF_DIR=$(mktemp -d)
+printf 'FORWARD="443,1080, 2087  8080=80"\n' >"$CONF_DIR/t.conf"
+[ "$(fwd_list t)" = "443 1080 2087 8080=80" ] || fail "fwd_list gave '$(fwd_list t)' for a comma-separated FORWARD"
+rm -rf "$CONF_DIR"; CONF_DIR=$CONF_DIR_SAVED
+ok "comma-separated FORWARD entries read as a list"
+
 S1=203.0.113.10 S2=198.51.100.20
 pair_params "$S1" "$S2" "$S1"; key1=$PAIR_KEY addr1=$PAIR_ADDR peer1=$PAIR_PEER
 pair_params "$S2" "$S1" "$S1"
@@ -155,7 +162,7 @@ ok "disguise switch moves the tunnel between dns and icmp and swaps the firewall
 # manage -> tunnel 1 -> port forwarding: add, refuse 22 and an overlap, remove one, no-op remove, clear
 # Both nat chains, this tunnel's tag exactly (192.0.2.1 must not match 192.0.2.10).
 fwd_rules() { iptables -t nat -S | tr -d '"' | grep -c -- " --comment golden-gre-fwd:192\.0\.2\.1 " || true; }
-printf '%s\n' 2 1 9 1 '8443 2053:2096' 1 22 1 2060 0 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+printf '%s\n' 2 1 9 1 '8443,2053:2096' 1 22 1 2060 0 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
 grep -qx 'FORWARD="8443 2053:2096"' "$CONF" || { cat "$tmp/menu.out"; fail "adding ports did not write FORWARD=\"8443 2053:2096\""; }
 grep -q 'SSH' "$tmp/menu.out" || { cat "$tmp/menu.out"; fail "refusing port 22 does not say why"; }
 grep -q "overlaps '2053:2096'" "$tmp/menu.out" || { cat "$tmp/menu.out"; fail "2060 inside 2053:2096 was not refused as an overlap"; }
