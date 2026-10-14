@@ -58,17 +58,26 @@ ip -n "$B" addr add 192.0.2.2/24 dev veth-b
 for ns in "$A" "$B"; do ip -n "$ns" link set lo up; done
 ip -n "$A" link set veth-a up
 ip -n "$B" link set veth-b up
+# Many addresses on server 2: `ip addr` prints more than a pipe buffer, so a check that greps it through
+# a pipe and stops early (grep -q) kills ip, and pipefail read that as "address not on this host".
+for i in $(seq 1 150); do
+  ip -n "$B" link add "d$i" type dummy
+  ip -n "$B" addr add "10.200.$i.1/24" dev "d$i"
+done
 
 # `ip netns exec` bind-mounts /etc/netns/<ns>/golden-gre over /etc/golden-gre: one config dir per "server".
 mkdir -p /etc/golden-gre "/etc/netns/$A/golden-gre" "/etc/netns/$B/golden-gre"
 
 # The real setup dialog, answers on stdin. systemd runs units in the root namespace only, so start the
-# tunnel the way the unit does: device first, then the relay.
+# tunnel the way the setup and the unit do: preflight, device, then the relay.
 run_setup() { # namespace
   # shellcheck disable=SC2016 # expands in the inner shell
   ip netns exec "$1" bash -c '
     . ./golden-gre.sh
-    start_tunnel() { golden-gre-up.sh "$1" >/dev/null && { golden-gre-relay.sh "$1" >/dev/null 2>&1 & }; }
+    start_tunnel() {
+      preflight.sh "$1" >/dev/null || { preflight.sh "$1"; return 1; }
+      golden-gre-up.sh "$1" >/dev/null && { golden-gre-relay.sh "$1" >/dev/null 2>&1 & }
+    }
     setup_tunnel'
 }
 

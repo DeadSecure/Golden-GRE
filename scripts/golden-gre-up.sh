@@ -35,7 +35,9 @@ esac
 
 # The relay binds LOCAL_PUB and needs a route to the peer. At early boot either may be missing:
 # fail before touching anything and let systemd's Restart= retry.
-ip -4 -o addr show 2>/dev/null | grep -qw "${LOCAL_PUB}" \
+# grep reads through < <(...), not a pipe: grep -q stops at the first match, and on a host whose address
+# list is longer than a pipe buffer that kills ip, which pipefail would read as "not configured".
+grep -qw "${LOCAL_PUB}" < <(ip -4 -o addr show 2>/dev/null) \
   || { echo "golden-gre: ${LOCAL_PUB} is not configured on this host yet" >&2; exit 1; }
 ip route get "${REMOTE_PUB}" >/dev/null 2>&1 \
   || { echo "golden-gre: no route to ${REMOTE_PUB} yet" >&2; exit 1; }
@@ -43,7 +45,7 @@ ip route get "${REMOTE_PUB}" >/dev/null 2>&1 \
 # A listener that already exists on a fresh bringup (no device yet) belongs to another tunnel on this
 # host: sharing it would let this tunnel's rollback or teardown remove the other one's listener. A
 # stale one from a crashed run is removed by the unit's ExecStopPost; by hand, run golden-gre-down.sh.
-if ! ip link show "${DEV}" >/dev/null 2>&1 && ip fou show 2>/dev/null | grep -q "port ${FOU_PORT} "; then
+if ! ip link show "${DEV}" >/dev/null 2>&1 && grep -q "port ${FOU_PORT} " < <(ip fou show 2>/dev/null); then
   echo "golden-gre: FOU port ${FOU_PORT} is already in use; give each tunnel on this host its own FOU_PORT ($CONF)" >&2
   exit 1
 fi
@@ -70,7 +72,7 @@ fi
 modprobe fou
 
 # FOU decapsulation listener, loopback only: the relay hands the peer's packets to it (idempotent)
-ip fou show 2>/dev/null | grep -q "port ${FOU_PORT} " \
+grep -q "port ${FOU_PORT} " < <(ip fou show 2>/dev/null) \
   || ip fou add port "${FOU_PORT}" ipproto 47 local 127.0.0.1
 
 # The relay's wire traffic takes packets from the peer only. Deleted and re-inserted so the rule sits

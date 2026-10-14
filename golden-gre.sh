@@ -219,8 +219,8 @@ setup_tunnel() {
     good "The peer answers through the tunnel. Done!"
   else
     say "The peer does not answer yet. That is normal until you run the same setup on $peer."
-    say "If $peer is already set up: check that both servers show the same pair check, and that the"
-    say "provider's firewall on each server lets in UDP port 53 from the other one."
+    say "If $peer is already set up: both servers must show the same pair check,"
+    say "and each provider's firewall must let in UDP port 53 from the other server."
   fi
 }
 

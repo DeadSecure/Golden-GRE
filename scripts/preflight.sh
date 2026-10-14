@@ -39,7 +39,8 @@ if [ -n "$NAME" ]; then
     done
     case "${LOCAL_PUB:-}${REMOTE_PUB:-}" in *:*) b "LOCAL_PUB and REMOTE_PUB must be IPv4 addresses" ;; esac
     if [ -n "${LOCAL_PUB:-}" ]; then
-      if ip -4 -o addr show | grep -qw "${LOCAL_PUB}"; then g "${LOCAL_PUB} is configured on this host"; else b "${LOCAL_PUB} is not an address of this host (the relay binds it)"; fi
+      # Not a pipe: grep -q would kill a long `ip` listing and pipefail would read "not here" (see golden-gre-up.sh).
+      if grep -qw "${LOCAL_PUB}" < <(ip -4 -o addr show); then g "${LOCAL_PUB} is configured on this host"; else b "${LOCAL_PUB} is not an address of this host (the relay binds it)"; fi
     fi
     FACADE="${FACADE:-dns}"
     case "$FACADE" in
