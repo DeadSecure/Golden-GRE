@@ -103,7 +103,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LivingG0D/Golden-GRE/main/go
 
 It installs what is missing (`gcc`, `iptables`, `ethtool`, …), builds Golden GRE, and asks four things: **server 1's IP, server 2's IP**, the **disguise** (ICMP or DNS, Enter = ICMP; same on both servers), and whether to turn on [FEC](#-lossy-paths-fec) on this server. Type the same two IPs on both servers, in any order. The script works out which end it is on and gives both ends the same GRE key and /30 tunnel subnet, so nothing else has to match by hand. When the second server is done, it pings the first through the tunnel.
 
-After that, `golden-gre` opens the menu: new tunnel, manage tunnels (status with a live ping, start/stop/restart, FEC on/off, disguise DNS/ICMP, delete), live logs, update, uninstall.
+After that, `golden-gre` opens the menu: new tunnel, manage tunnels (status with a live ping, start/stop/restart, FEC on/off, disguise DNS/ICMP, port forwarding, delete), live logs, update, uninstall.
 
 Setup defaults to the ICMP disguise: it passed on every path measured so far, while the DNS disguise was cut after 6 packets per flow on an Iran–Kharej 2 path (where ICMP carried 500–690 Mbit/s). On the Iran–Kharej 1 path in [docs/FILTER.md](docs/FILTER.md) both passed and DNS was faster. If the ping through the tunnel stops after a few packets, or never answers, switch **both** servers to the other disguise in **Manage tunnels → Disguise**.
 
@@ -207,6 +207,7 @@ One file per tunnel: `/etc/golden-gre/<name>.conf`. `<name>` is the systemd inst
 | `ROUTES` | ⬜ | `"192.0.2.0/24 198.18.0.0/24"` | Space-separated CIDRs to route via this tunnel. |
 | `NAT_SRC` | ⬜ | `10.99.99.0/30` | If set, MASQUERADE this source out `NAT_OUT` (use this node as an internet exit). |
 | `NAT_OUT` | ⬜ | `eth0` | Egress interface for `NAT_SRC`. Unset: any interface except the tunnel itself. |
+| `FORWARD` | ⬜ | `"443 2053:2096 8080=80"` | Ports on `LOCAL_PUB` to forward through the tunnel to the peer, TCP and UDP: `P` to port P, `A:B` to the same ports, `P=Q` to port Q. Port 22 is refused. See [Port forwarding](#port-forwarding). |
 | `PEER_ADDR` | ⬜ | `10.99.99.2` | Peer's overlay address for `golden-gre-check`. Unset: derived as the other host of a /30 or /31 `TUN_ADDR`. |
 
 > 📝 IPs above use the RFC 5737 documentation ranges. Replace with your real values **in `/etc/golden-gre/` on each host** — never commit them.
@@ -307,6 +308,21 @@ Each spoke runs an ordinary point-to-point config pointed back at the hub, with 
 ```bash
 ROUTES="10.50.0.0/24"
 ```
+
+### Port forwarding
+
+Send clients to the Iran server's public IP and have the service run on the Kharej server: forwarded ports go through the tunnel. In the menu: **Manage tunnels → tunnel → Port forwarding → Add ports**, on the server the clients connect to. Or in its config:
+
+```bash
+FORWARD="443 2053:2096 8080=80"   # 443 -> peer 443, 2053-2096 -> same ports, 8080 -> peer 80; TCP and UDP
+```
+
+`golden-gre-up.sh` adds a DNAT to the peer's tunnel address for each entry (for traffic to `LOCAL_PUB` only) and a MASQUERADE on the tunnel, so the peer answers through the tunnel. The rules carry the comment `golden-gre-fwd:<name>`: they follow the tunnel (back after a reboot, gone on stop or delete), and a changed `FORWARD` leaves nothing stale.
+
+- Traffic from the peer's own public address is never forwarded: that is the relay's traffic and the peer's SSH.
+- Port 22 is refused, and the menu also refuses this server's actual SSH port and warns before taking a port a local program listens on.
+- The service on the peer sees connections from this end's tunnel address (`10.99.x.x`), not the client's address. It must listen on `0.0.0.0` or its tunnel address; with ufw on the peer, `ufw allow in on gre1`.
+- Forwarding is kernel NAT, so it costs nothing beyond the tunnel itself.
 
 **Use a node as an internet exit** (e.g. send the overlay's traffic out the USA box):
 
