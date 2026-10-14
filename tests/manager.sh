@@ -81,14 +81,16 @@ run_setup() { # namespace
     setup_tunnel'
 }
 
-printf '192.0.2.1\n192.0.2.2\ny\n' | run_setup "$A" >"$tmp/a.out" 2>&1 || { cat "$tmp/a.out"; fail "setup failed on server 1"; }
+# Answers: server 1 IP, server 2 IP, disguise (Enter = the default, icmp), FEC.
+printf '192.0.2.1\n192.0.2.2\n\ny\n' | run_setup "$A" >"$tmp/a.out" 2>&1 || { cat "$tmp/a.out"; fail "setup failed on server 1"; }
 # Server 2 types the IPs in the other order on purpose.
-printf '192.0.2.2\n192.0.2.1\nn\n' | run_setup "$B" >"$tmp/b.out" 2>&1 || { cat "$tmp/b.out"; fail "setup failed on server 2"; }
+printf '192.0.2.2\n192.0.2.1\n\nn\n' | run_setup "$B" >"$tmp/b.out" 2>&1 || { cat "$tmp/b.out"; fail "setup failed on server 2"; }
 
 confA="/etc/netns/$A/golden-gre/192.0.2.2.conf" confB="/etc/netns/$B/golden-gre/192.0.2.1.conf"
 if ! { [ -r "$confA" ] && [ -r "$confB" ]; }; then fail "setup did not write the configs (want $confA and $confB)"; fi
 grep -qx 'FEC=10:5' "$confA" || fail "FEC=yes on server 1 did not write FEC=10:5"
 if grep -q '^FEC=' "$confB"; then fail "FEC=no on server 2 still wrote FEC"; fi
+for c in "$confA" "$confB"; do grep -qx 'FACADE=icmp' "$c" || fail "the default disguise did not write FACADE=icmp to $c"; done
 [ "$(grep '^GRE_KEY=' "$confA")" = "$(grep '^GRE_KEY=' "$confB")" ] || fail "the two configs have different GRE keys"
 grep -q 'answers' "$tmp/b.out" || { cat "$tmp/b.out"; fail "setup on server 2 did not report the peer answering"; }
 
@@ -117,8 +119,8 @@ U="golden-gre@192.0.2.1" CONF="$CONF_DIR/192.0.2.1.conf"
 src="$(src_for 192.0.2.1)"   # an unreachable documentation peer, as in tests/systemd.sh
 rm -f "$SELF"
 
-# first run: installs, sets up a tunnel (no FEC), exits
-printf '%s\n' y "$src" 192.0.2.1 n 0 | bash ./golden-gre.sh >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "first run failed"; }
+# first run: installs, sets up a tunnel (dns disguise, no FEC), exits
+printf '%s\n' y "$src" 192.0.2.1 2 n 0 | bash ./golden-gre.sh >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "first run failed"; }
 [ -x "$SELF" ] || fail "first run did not install the golden-gre command"
 systemctl is-active -q "$U" || { cat "$tmp/menu.out"; journalctl -u "$U" -n 20 --no-pager; fail "$U is not running after setup"; }
 systemctl is-enabled -q "$U" || fail "$U is not enabled at boot"
@@ -138,9 +140,9 @@ grep -qx 'FACADE=icmp' "$CONF" || { cat "$tmp/menu.out"; fail "disguise switch d
 systemctl is-active -q "$U" || fail "$U is not running after the disguise switch"
 [[ $(rules) == *"-p icmp"* ]] || fail "no ICMP accept after switching to icmp: $(rules)"
 [[ $(rules) != *"--dport 53"* ]] || fail "the dns disguise's UDP 53 accept was left behind: $(rules)"
-# and back: no FACADE line means dns
+# and back to dns
 printf '%s\n' 2 1 8 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
-if grep -q '^FACADE=' "$CONF"; then fail "switching back to dns left a FACADE line"; fi
+grep -qx 'FACADE=dns' "$CONF" || fail "switching back did not write FACADE=dns"
 [[ $(rules) == *"--dport 53"* && $(rules) != *"-p icmp"* ]] || fail "wrong accept rules after switching back to dns: $(rules)"
 ok "disguise switch moves the tunnel between dns and icmp and swaps the firewall rule"
 

@@ -136,7 +136,7 @@ remove_tunnel() { # name — stop first: the unit's teardown reads the config
 }
 
 setup_tunnel() {
-  local s1 s2 me peer lp name conf fec='' dev fou relay hint other
+  local s1 s2 me peer lp name conf fec='' facade dev fou relay hint other
   local -a taken
   say ""
   say "${Y}New tunnel${N}: run this same setup on both servers, with the same two IPs."
@@ -173,7 +173,7 @@ setup_tunnel() {
     remove_tunnel "$name"
   fi
   if other=$(owner_of LOCAL_PUB "$lp"); then
-    bad "This server already has a tunnel on $lp (tunnel $other). Each tunnel needs its own public IP on this server: the relay takes UDP port 53 on it. If you no longer need that tunnel, delete it in 'Manage tunnels' first."
+    bad "This server already has a tunnel on $lp (tunnel $other). Each tunnel needs its own public IP on this server: its relay owns that address. If you no longer need that tunnel, delete it in 'Manage tunnels' first."
     return 1
   fi
   pair_params "$s1" "$s2" "$me"
@@ -182,6 +182,16 @@ setup_tunnel() {
     bad "Rare clash with another tunnel on this server (same GRE key or tunnel subnet). Write $conf by hand; see the README."
     return 1
   fi
+
+  say ""
+  say "Disguise: what the tunnel's traffic looks like on the wire. Both servers must pick the same one."
+  say "  1) ICMP: ping replies. Passed on every path measured so far."
+  say "  2) DNS:  queries to UDP port 53. Some paths cut it after a few packets."
+  ask "Disguise? [1/2] (Enter = 1, ICMP) " 1
+  case $REPLY in
+    2 | [dD]*) facade=dns ;;
+    *) facade=icmp ;;
+  esac
 
   say ""
   say "FEC repairs lost packets. It adds 50% to the traffic this server sends."
@@ -202,6 +212,7 @@ setup_tunnel() {
     echo "GRE_KEY=$PAIR_KEY"
     echo "FOU_PORT=$fou"
     echo "RELAY_PORT=$relay"
+    echo "FACADE=$facade"
     if [ -n "$fec" ]; then echo "FEC=$fec"; fi
   } >"$conf"
   good "Saved $conf"
@@ -214,15 +225,19 @@ setup_tunnel() {
   good "Tunnel to $peer is running on this server."
   say "  This server: $me, tunnel IP ${PAIR_ADDR%/*}"
   say "  Peer:        $peer, tunnel IP $PAIR_PEER  (use this address to reach the peer through the tunnel)"
-  say "  Pair check:  key $PAIR_KEY, subnet $(net_of "$PAIR_ADDR")/30  (both servers must show the same)"
+  say "  Pair check:  key $PAIR_KEY, subnet $(net_of "$PAIR_ADDR")/30, disguise $facade  (both servers must show the same)"
   if ping -c 2 -W 2 -q "$PAIR_PEER" >/dev/null 2>&1; then
     good "The peer answers through the tunnel. Done!"
   else
     say "The peer does not answer yet. That is normal until you run the same setup on $peer."
-    say "If $peer is already set up: both servers must show the same pair check,"
-    say "and each provider's firewall must let in UDP port 53 from the other server."
-    say "If the ping works for a few packets and then stops, the path cuts the DNS disguise:"
-    say "switch both servers to ICMP in 'Manage tunnels' (Disguise)."
+    say "If $peer is already set up: both servers must show the same pair check, and each"
+    if [ "$facade" = dns ]; then
+      say "provider's firewall must let in UDP port 53 from the other server."
+    else
+      say "provider's firewall must let in ICMP (ping) from the other server."
+    fi
+    say "If the ping works for a few packets and then stops, or never works, the path cuts this"
+    say "disguise: switch both servers to the other one in 'Manage tunnels' (Disguise)."
   fi
 }
 
@@ -278,7 +293,7 @@ toggle_disguise() { # name — what the wire traffic looks like: DNS queries to 
   # Stop before editing: the teardown removes the firewall rule of the disguise the tunnel started with.
   if systemctl is-active -q "golden-gre@$1"; then running=1; systemctl stop "golden-gre@$1"; fi
   sed -i '/^FACADE=/d' "$conf"
-  if [ "$new" = icmp ]; then echo "FACADE=icmp" >>"$conf"; fi
+  echo "FACADE=$new" >>"$conf"
   good "Disguise is now $new. Switch the other server to $new too: both ends must use the same one."
   if [ "$running" = 1 ]; then systemctl start "golden-gre@$1" && good "Restarted"; fi
 }
