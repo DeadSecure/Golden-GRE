@@ -33,6 +33,40 @@ case "${FACADE}" in
   *) echo "golden-gre: FACADE must be dns or icmp ($CONF)" >&2; exit 1 ;;
 esac
 
+# Port forwarding: FORWARD="443 2053:2096 8080=80" sends this host's public ports (TCP and UDP) through the
+# tunnel to the peer's overlay address: P to port P, A:B to the same ports, P=Q to port Q. Checked here,
+# before anything is touched, so a bad entry never takes down a live tunnel.
+FWD_PORTS=() FWD_DEST=()
+if [ -n "${FORWARD:-}" ]; then
+  fwd_bad() { echo "golden-gre: FORWARD entry '$1' $2 ($CONF)" >&2; exit 1; }
+  if [ -n "${PEER_ADDR:-}" ]; then
+    [[ $PEER_ADDR =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "golden-gre: PEER_ADDR must be an IPv4 address ($CONF)" >&2; exit 1; }
+    fwd_peer=$PEER_ADDR
+  else
+    ip4="${TUN_ADDR%/*}" last="${TUN_ADDR%/*}"; last="${last##*.}"
+    case "${TUN_ADDR#*/}" in
+      30) fwd_peer="${ip4%.*}.$(( (last & ~3) + 3 - (last & 3) ))" ;;
+      31) fwd_peer="${ip4%.*}.$(( last ^ 1 ))" ;;
+      *) echo "golden-gre: set PEER_ADDR in $CONF to use FORWARD (TUN_ADDR is not a /30 or /31)" >&2; exit 1 ;;
+    esac
+  fi
+  read -ra _fwd <<<"${FORWARD}"
+  for e in ${_fwd[@]+"${_fwd[@]}"}; do
+    if [[ $e =~ ^([0-9]{1,5})(:([0-9]{1,5}))?$ ]]; then
+      lo=$(( 10#${BASH_REMATCH[1]} )) hi=$(( 10#${BASH_REMATCH[3]:-${BASH_REMATCH[1]}} )) to=''
+    elif [[ $e =~ ^([0-9]{1,5})=([0-9]{1,5})$ ]]; then
+      lo=$(( 10#${BASH_REMATCH[1]} )) hi=$lo to=$(( 10#${BASH_REMATCH[2]} ))
+    else
+      fwd_bad "$e" "is not PORT, FIRST:LAST or PORT=PEER_PORT"
+    fi
+    for p in "$lo" "$hi" ${to:+"$to"}; do (( p >= 1 && p <= 65535 )) || fwd_bad "$e" "has a port outside 1-65535"; done
+    (( lo <= hi )) || fwd_bad "$e" "is a range that ends before it starts"
+    (( lo > 22 || hi < 22 )) || fwd_bad "$e" "includes port 22: forwarding SSH would lock you out of this server"
+    if [ "$lo" = "$hi" ]; then FWD_PORTS+=("$lo"); else FWD_PORTS+=("$lo:$hi"); fi
+    FWD_DEST+=("${fwd_peer}${to:+:$to}")
+  done
+fi
+
 # The relay binds LOCAL_PUB and needs a route to the peer. At early boot either may be missing:
 # fail before touching anything and let systemd's Restart= retry.
 # grep reads through < <(...), not a pipe: grep -q stops at the first match, and on a host whose address
@@ -125,6 +159,29 @@ if [ -n "${NAT_SRC:-}" ]; then
   if [ -n "${NAT_OUT:-}" ]; then OUT=(-o "${NAT_OUT}"); else OUT=(! -o "${DEV}"); fi
   iptables -t nat -C POSTROUTING -s "${NAT_SRC}" "${OUT[@]}" -j MASQUERADE 2>/dev/null \
     || iptables -t nat -A POSTROUTING -s "${NAT_SRC}" "${OUT[@]}" -j MASQUERADE
+fi
+
+# Port forwarding (FORWARD, checked above). This tunnel's old rules go first, so a changed FORWARD leaves
+# nothing behind. Traffic from the peer's own address is never forwarded: that is the relay's own traffic,
+# and the peer's SSH. MASQUERADE makes the peer answer through the tunnel instead of its own default route.
+while read -r rule; do
+  rule=${rule//\"/}   # iptables -S quotes the comment; the tag has no spaces
+  [[ " $rule " == *" --comment golden-gre-fwd:${NAME} "* ]] || continue
+  read -ra args <<<"${rule/#-A /-D }"
+  iptables -t nat "${args[@]}"
+done < <(iptables -t nat -S)
+if [ "${#FWD_PORTS[@]}" -gt 0 ]; then
+  sysctl -qw net.ipv4.ip_forward=1
+  for i in "${!FWD_PORTS[@]}"; do
+    for proto in tcp udp; do
+      iptables -t nat -A PREROUTING -d "${LOCAL_PUB}" ! -s "${REMOTE_PUB}" -p "$proto" --dport "${FWD_PORTS[i]}" \
+        -m comment --comment "golden-gre-fwd:${NAME}" -j DNAT --to-destination "${FWD_DEST[i]}"
+    done
+  done
+  # Inserted, not appended: an earlier catch-all SNAT/ACCEPT in POSTROUTING would otherwise win, and the
+  # peer would answer by its own default route. The match is narrow enough to go first.
+  iptables -t nat -I POSTROUTING -o "${DEV}" -m conntrack --ctstate DNAT \
+    -m comment --comment "golden-gre-fwd:${NAME}" -j MASQUERADE
 fi
 
 echo "golden-gre: ${DEV} up — ${TUN_ADDR} -> ${REMOTE_PUB} (relay ${FACADE}, mtu ${MTU}); run the relay: golden-gre-relay.sh ${NAME}"

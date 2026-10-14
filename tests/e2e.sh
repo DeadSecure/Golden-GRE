@@ -127,6 +127,46 @@ got="$(ip netns exec "$A" curl -s --max-time 60 -o "$tmp/got" -w '%{size_downloa
 cmp -s "$tmp/blob" "$tmp/got" || fail "transferred data differs"
 ok "20 MB transferred through the tunnel, bit for bit"
 
+# --- port forwarding: A's public ports to services on B, through the tunnel -----
+# The client is B's second address (192.0.2.12): anything but the peer's own address is forwarded.
+ip netns exec "$B" python3 -c '
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("10.99.99.2", 9000))
+while True:
+    d, a = s.recvfrom(2048); s.sendto(b"echo:" + d, a)' >/dev/null 2>&1 &
+pids+=("$!")
+echo 'FORWARD="8080=8000 8000 9000:9001"' >>"/etc/golden-gre/$CA.conf"
+ip netns exec "$A" "$UP" "$CA" >/dev/null
+ip netns exec "$A" "$UP" "$CA" >/dev/null   # a re-run must not duplicate the rules
+fwd="$(ip netns exec "$A" iptables-save -t nat | grep -F "golden-gre-fwd:$CA" || true)"
+[ "$(grep -c -- "-j DNAT" <<<"$fwd")" = 6 ] || fail "want 6 DNAT rules (3 entries x tcp/udp), got: $fwd"
+[ "$(grep -c MASQUERADE <<<"$fwd")" = 1 ] || fail "want 1 MASQUERADE for forwarded traffic, got: $fwd"
+got="$(ip netns exec "$B" curl -s --max-time 20 --interface 192.0.2.12 -o "$tmp/got" -w '%{size_download}' http://192.0.2.1:8080/blob)"
+if ! { [ "$got" = 20000000 ] && cmp -s "$tmp/blob" "$tmp/got"; }; then fail "TCP 8080=8000 through A returned $got bytes"; fi
+got="$(ip netns exec "$B" curl -s --max-time 20 --interface 192.0.2.12 -o /dev/null -w '%{http_code}' http://192.0.2.1:8000/blob)"
+[ "$got" = 200 ] || fail "TCP 8000 (same port) through A returned HTTP $got"
+got="$(ip netns exec "$B" python3 -c '
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("192.0.2.12", 0)); s.settimeout(5)
+s.sendto(b"hi", ("192.0.2.1", 9000)); print(s.recvfrom(2048)[0].decode())' 2>&1)"
+[ "$got" = "echo:hi" ] || fail "UDP 9000 (range 9000:9001) through A returned: $got"
+# The peer's own address is never forwarded: that is the relay's traffic (UDP 53) and the peer's SSH.
+ip netns exec "$B" curl -s --max-time 5 --interface 192.0.2.2 -o /dev/null http://192.0.2.1:8000/ \
+  && fail "traffic from the peer's own address was forwarded"
+ok "forwarded TCP (P=Q and same port) and UDP (range) reach the peer's services; the peer's own traffic is not forwarded"
+
+sed -i 's/^FORWARD=.*/FORWARD="8080=8000"/' "/etc/golden-gre/$CA.conf"
+ip netns exec "$A" "$UP" "$CA" >/dev/null
+fwd="$(ip netns exec "$A" iptables-save -t nat | grep -F "golden-gre-fwd:$CA" || true)"
+[ "$(grep -c -- "-j DNAT" <<<"$fwd")" = 2 ] || fail "removed entries left DNAT rules behind: $fwd"
+for bad in 0 70000 22 80:70 abc 8080=0; do
+  sed -i "s/^FORWARD=.*/FORWARD=\"$bad\"/" "/etc/golden-gre/$CA.conf"
+  ip netns exec "$A" "$UP" "$CA" >/dev/null 2>&1 && fail "up accepted FORWARD=\"$bad\""
+done
+sed -i 's/^FORWARD=.*/FORWARD="8080=8000"/' "/etc/golden-gre/$CA.conf"
+ip netns exec "$A" ping -c 3 -W 2 -q 10.99.99.2 >/dev/null || fail "a refused FORWARD entry tore down the live tunnel"
+ok "changed FORWARD drops old rules; invalid entries and port 22 are refused without tearing the tunnel down"
+
 # --- a failing re-run on a live tunnel must not tear it down -------------------
 # systemd still shows such a tunnel active, so nothing would bring it back.
 echo 'ROUTES="10.50.0.0/33"' >>"/etc/golden-gre/$CA.conf"
@@ -210,7 +250,7 @@ ip netns exec "$A" "$DOWN" "$CA"
 ip netns exec "$A" "$DOWN" "$CA" >/dev/null   # second run must be harmless
 ip -n "$A" link show gre1 >/dev/null 2>&1 && fail "gre1 still exists after down"
 ip netns exec "$A" ip fou show | grep -q 'port 5599' && fail "FOU listener left behind"
-ip netns exec "$A" iptables-save | grep -qE 'gre1|golden-gre:' && fail "iptables rules left behind"
+ip netns exec "$A" iptables-save | grep -qE 'gre1|golden-gre:|golden-gre-fwd:' && fail "iptables rules left behind"
 ok "down removed device, FOU listener and rules"
 
 # --- the icmp facade -----------------------------------------------------------

@@ -298,6 +298,129 @@ toggle_disguise() { # name — what the wire traffic looks like: DNS queries to 
   if [ "$running" = 1 ]; then systemctl start "golden-gre@$1" && good "Restarted"; fi
 }
 
+# Port forwarding: FORWARD in the config, applied by golden-gre-up.sh (TCP and UDP, through the tunnel to the
+# peer). Entries: PORT, FIRST:LAST, or PORT=PEER_PORT.
+fwd_range() { # entry -> FWD_LO FWD_HI; status 1 when it is not a valid entry
+  local to=''
+  if [[ $1 =~ ^([0-9]{1,5})(:([0-9]{1,5}))?$ ]]; then
+    FWD_LO=$(( 10#${BASH_REMATCH[1]} )) FWD_HI=$(( 10#${BASH_REMATCH[3]:-${BASH_REMATCH[1]}} ))
+  elif [[ $1 =~ ^([0-9]{1,5})=([0-9]{1,5})$ ]]; then
+    FWD_LO=$(( 10#${BASH_REMATCH[1]} )) FWD_HI=$FWD_LO to=$(( 10#${BASH_REMATCH[2]} ))
+  else
+    return 1
+  fi
+  (( FWD_LO >= 1 && FWD_HI <= 65535 && FWD_LO <= FWD_HI )) && (( ${to:-1} >= 1 && ${to:-1} <= 65535 ))
+}
+valid_forward() { # entry: well formed and not over port 22 (golden-gre-up.sh refuses that too)
+  fwd_range "$1" && (( FWD_LO > 22 || FWD_HI < 22 ))
+}
+set_forward() { # name "entries" — write FORWARD; restart a running tunnel so the rules follow
+  local conf="$CONF_DIR/$1.conf" v cur
+  v=$(tr -s ' ' <<<" $2 "); v=${v# }; v=${v% }
+  cur=$(conf_get "$1" FORWARD)
+  if [ "$v" = "$cur" ]; then say "No change."; return 0; fi
+  if [ -n "$v" ] && [ -z "$(conf_get "$1" PEER_ADDR)" ]; then
+    case "$(conf_get "$1" TUN_ADDR)" in
+      */30 | */31) ;;
+      *) bad "Forwarding needs PEER_ADDR in $conf: its TUN_ADDR is not a /30 or /31."; return 1 ;;
+    esac
+  fi
+  sed -i '/^FORWARD=/d' "$conf"
+  if [ -n "$v" ]; then echo "FORWARD=\"$v\"" >>"$conf"; fi
+  if systemctl is-active -q "golden-gre@$1"; then
+    systemctl restart "golden-gre@$1" && good "Restarted. Forwarded ports: ${v:-none}"
+  else
+    good "Saved. Forwarded ports: ${v:-none} (applied when the tunnel starts)"
+  fi
+}
+fwd_overlap() { # entry "entries" -> the first listed entry whose ports on this server overlap entry's
+  local lo hi x
+  local -a list
+  fwd_range "$1" || return 1
+  lo=$FWD_LO hi=$FWD_HI
+  read -ra list <<<"$2"
+  for x in ${list[@]+"${list[@]}"}; do
+    fwd_range "$x" || continue
+    if (( FWD_LO <= hi && lo <= FWD_HI )); then echo "$x"; return 0; fi
+  done
+  return 1
+}
+add_forwards() { # name
+  local n=$1 cur e p ok dev lp relay='' add='' other
+  local -a in=() ssh_ports=() listening=()
+  cur=$(conf_get "$n" FORWARD) lp=$(conf_get "$n" LOCAL_PUB)
+  # The dns facade's own relay listens on LOCAL_PUB:DNS_PORT; the peer's traffic is never forwarded, so it stays.
+  [ "$(conf_get "$n" FACADE dns)" = icmp ] || relay=$(conf_get "$n" DNS_PORT 53)
+  say "Examples: 443   2053:2096 (a range)   8080=80 (this server's 8080 to the peer's 80). Each is TCP and UDP."
+  ask "Ports to add: "
+  read -ra in <<<"$REPLY"
+  mapfile -t ssh_ports < <({ echo 22; sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }'; } | sort -un)
+  # Only listeners the forwarding takes over: on LOCAL_PUB or on every address.
+  mapfile -t listening < <(ss -Hltun 2>/dev/null | awk -v lp="$lp" -v relay="$relay" '{
+      n = split($5, a, ":"); port = a[n]; addr = substr($5, 1, length($5) - length(port) - 1); sub(/%.*/, "", addr)
+      if ((addr == lp || addr == "0.0.0.0" || addr == "*" || addr == "[::]") && port != relay) print port }' | sort -un)
+  for e in ${in[@]+"${in[@]}"}; do
+    if ! fwd_range "$e"; then bad "'$e' is not a port, a FIRST:LAST range, or PORT=PEER_PORT"; continue; fi
+    ok=1
+    for p in "${ssh_ports[@]}"; do
+      if (( FWD_LO <= p && p <= FWD_HI )); then
+        bad "'$e' includes port $p, this server's SSH: forwarding it would lock you out. Skipped."
+        ok=0
+      fi
+    done
+    [ "$ok" = 1 ] || continue
+    if other=$(fwd_overlap "$e" "$cur $add"); then
+      bad "'$e' overlaps '$other', which is already forwarded. Remove that one first to change it. Skipped."
+      continue
+    fi
+    fwd_range "$e"
+    for p in ${listening[@]+"${listening[@]}"}; do
+      if (( FWD_LO <= p && p <= FWD_HI )); then
+        yes_no "A program on this server listens on port $p; forwarding '$e' takes that port away from it. Forward anyway? [y/N] " n || ok=0
+        break
+      fi
+    done
+    [ "$ok" = 1 ] || continue
+    add+=" $e"
+  done
+  [ -n "$add" ] || return 0
+  set_forward "$n" "$cur$add" || return
+  dev=$(conf_get "$n" DEV)
+  say "On $(conf_get "$n" REMOTE_PUB), the service must listen on those ports (on 0.0.0.0 or its tunnel IP)."
+  say "If that server runs ufw, also run there: ufw allow in on $dev"
+}
+remove_forwards() { # name
+  local n=$1 cur e keep=''
+  local -a list=()
+  cur=$(conf_get "$n" FORWARD)
+  [ -n "$cur" ] || { say "No forwarded ports."; return 0; }
+  ask "Ports to remove, exactly as listed ($cur): "
+  read -ra list <<<"$cur"
+  for e in ${list[@]+"${list[@]}"}; do [[ " $REPLY " == *" $e "* ]] || keep+=" $e"; done
+  if [ "${keep# }" = "$cur" ]; then say "Nothing matched: type entries exactly as listed."; return 0; fi
+  set_forward "$n" "$keep"
+}
+forward_menu() { # name
+  local n=$1
+  while :; do
+    say ""
+    say "${Y}Port forwarding${N}: connections to this server's public IP on these ports go through the tunnel to the peer."
+    say "  Forwarded now: $(conf_get "$n" FORWARD none)"
+    say "   1) Add ports"
+    say "   2) Remove ports"
+    say "   3) Remove all"
+    say "   0) Back"
+    ask "> "
+    case $REPLY in
+      1) add_forwards "$n" ;;
+      2) remove_forwards "$n" ;;
+      3) if [ -z "$(conf_get "$n" FORWARD)" ]; then say "No forwarded ports."
+         elif yes_no "Stop forwarding all ports? [y/N] " n; then set_forward "$n" ""; fi ;;
+      0 | '') return ;;
+    esac
+  done
+}
+
 tunnel_menu() { # name
   local n=$1 peer disguise fec
   while :; do
@@ -313,8 +436,9 @@ tunnel_menu() { # name
     say "   6) Live logs"
     say "   7) Disguise: $disguise (switch to $([ "$disguise" = icmp ] && echo dns || echo icmp))"
     say "   8) FEC: $fec (turn $([ "$fec" = off ] && echo on || echo off))"
-    say "   9) Show settings"
-    say "  10) Delete"
+    say "   9) Port forwarding: $(conf_get "$n" FORWARD none)"
+    say "  10) Show settings"
+    say "  11) Delete"
     say "   0) Back"
     ask "> "
     case $REPLY in
@@ -327,8 +451,9 @@ tunnel_menu() { # name
       6) follow_logs "$n" ;;
       7) toggle_disguise "$n" ;;
       8) toggle_fec "$n" ;;
-      9) cat "$CONF_DIR/$n.conf" ;;
-      10) if yes_no "Delete tunnel $n? It stops now and its settings are removed. [y/N] " n; then
+      9) forward_menu "$n" ;;
+      10) cat "$CONF_DIR/$n.conf" ;;
+      11) if yes_no "Delete tunnel $n? It stops now and its settings are removed. [y/N] " n; then
            remove_tunnel "$n"
            good "Deleted"
            return

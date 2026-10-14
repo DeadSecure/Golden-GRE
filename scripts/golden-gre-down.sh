@@ -34,5 +34,13 @@ if [ -n "${REMOTE_PUB:-}" ]; then
   iptables -D INPUT "${WIRE[@]}" -s "${REMOTE_PUB}" -m comment --comment "golden-gre:${NAME}" -j ACCEPT 2>/dev/null || true
 fi
 
+# Port forwarding rules, found by their tag, so they go even when FORWARD changed since up.
+while read -r rule; do
+  rule=${rule//\"/}   # iptables -S quotes the comment; the tag has no spaces
+  [[ " $rule " == *" --comment golden-gre-fwd:${NAME} "* ]] || continue
+  read -ra args <<<"${rule/#-A /-D }"
+  iptables -t nat "${args[@]}" 2>/dev/null || true
+done < <(iptables -t nat -S 2>/dev/null)
+
 echo "golden-gre: ${NAME} down"
 exit 0
