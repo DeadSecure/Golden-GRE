@@ -127,7 +127,7 @@ systemctl is-enabled -q "$U" || fail "$U is not enabled at boot"
 ok "first run installs, sets up a tunnel, and systemd runs it"
 
 # manage -> tunnel 1 -> FEC on -> back, back, exit
-printf '%s\n' 2 1 7 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+printf '%s\n' 2 1 8 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
 grep -qx 'FEC=10:5' "$CONF" || { cat "$tmp/menu.out"; fail "FEC on did not reach the config"; }
 systemctl is-active -q "$U" || fail "$U is not running after the FEC restart"
 ok "FEC toggle writes the config and restarts the tunnel"
@@ -135,13 +135,13 @@ ok "FEC toggle writes the config and restarts the tunnel"
 # manage -> tunnel 1 -> disguise (dns -> icmp) -> back, back, exit
 rules() { iptables -S INPUT | grep -F "golden-gre:192.0.2.1" || true; }
 [[ $(rules) == *"--dport 53"* ]] || fail "no UDP 53 accept for the dns disguise before the switch"
-printf '%s\n' 2 1 8 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+printf '%s\n' 2 1 7 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
 grep -qx 'FACADE=icmp' "$CONF" || { cat "$tmp/menu.out"; fail "disguise switch did not write FACADE=icmp"; }
 systemctl is-active -q "$U" || fail "$U is not running after the disguise switch"
 [[ $(rules) == *"-p icmp"* ]] || fail "no ICMP accept after switching to icmp: $(rules)"
 [[ $(rules) != *"--dport 53"* ]] || fail "the dns disguise's UDP 53 accept was left behind: $(rules)"
 # and back to dns
-printf '%s\n' 2 1 8 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+printf '%s\n' 2 1 7 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
 grep -qx 'FACADE=dns' "$CONF" || fail "switching back did not write FACADE=dns"
 [[ $(rules) == *"--dport 53"* && $(rules) != *"-p icmp"* ]] || fail "wrong accept rules after switching back to dns: $(rules)"
 ok "disguise switch moves the tunnel between dns and icmp and swaps the firewall rule"

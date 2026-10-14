@@ -299,24 +299,34 @@ toggle_disguise() { # name — what the wire traffic looks like: DNS queries to 
 }
 
 tunnel_menu() { # name
-  local n=$1 peer
+  local n=$1 peer disguise fec
   while :; do
     peer=$(conf_get "$n" PEER_ADDR "$(peer_of "$(conf_get "$n" TUN_ADDR)")")
+    disguise=$(conf_get "$n" FACADE dns) fec=$(conf_get "$n" FEC off)
     say ""
-    say "${Y}Tunnel $n${N}: $(systemctl is-active "golden-gre@$n" 2>/dev/null), disguise $(conf_get "$n" FACADE dns), FEC $(conf_get "$n" FEC off)"
-    say "  1) Restart  2) Stop  3) Start  4) Ping test  5) Recent logs  6) Live logs"
-    say "  7) FEC on/off  8) Disguise DNS/ICMP  9) Show settings  10) Delete  0) Back"
+    say "${Y}Tunnel $n${N}: $(systemctl is-active "golden-gre@$n" 2>/dev/null), disguise $disguise, FEC $fec"
+    say "   1) Start"
+    say "   2) Stop"
+    say "   3) Restart"
+    say "   4) Ping test"
+    say "   5) Recent logs"
+    say "   6) Live logs"
+    say "   7) Disguise: $disguise (switch to $([ "$disguise" = icmp ] && echo dns || echo icmp))"
+    say "   8) FEC: $fec (turn $([ "$fec" = off ] && echo on || echo off))"
+    say "   9) Show settings"
+    say "  10) Delete"
+    say "   0) Back"
     ask "> "
     case $REPLY in
-      1) systemctl restart "golden-gre@$n" && good "Restarted" ;;
-      2) systemctl disable --now "golden-gre@$n" >/dev/null 2>&1 && good "Stopped (it stays off after reboot too)" ;;
-      3) if systemctl is-active -q "golden-gre@$n"; then good "Already running"
+      1) if systemctl is-active -q "golden-gre@$n"; then good "Already running"
          else start_tunnel "$n" && good "Started (and starts on every boot)"; fi ;;
+      2) systemctl disable --now "golden-gre@$n" >/dev/null 2>&1 && good "Stopped (it stays off after reboot too)" ;;
+      3) systemctl restart "golden-gre@$n" && good "Restarted" ;;
       4) interruptible ping -c 5 -W 2 "$peer" ;;
       5) journalctl -u "golden-gre@$n" -n 50 --no-pager ;;
       6) follow_logs "$n" ;;
-      7) toggle_fec "$n" ;;
-      8) toggle_disguise "$n" ;;
+      7) toggle_disguise "$n" ;;
+      8) toggle_fec "$n" ;;
       9) cat "$CONF_DIR/$n.conf" ;;
       10) if yes_no "Delete tunnel $n? It stops now and its settings are removed. [y/N] " n; then
            remove_tunnel "$n"
