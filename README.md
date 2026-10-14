@@ -93,14 +93,16 @@ Run this on **both** servers, as root:
 bash <(curl -fsSL https://raw.githubusercontent.com/LivingG0D/Golden-GRE/main/golden-gre.sh)
 ```
 
-It installs what is missing (`gcc`, `iptables`, `ethtool`, …), builds Golden GRE, and asks three things: **server 1's IP, server 2's IP**, and whether to turn on [FEC](#-lossy-paths-fec) on this server. Type the same two IPs on both servers, in any order. The script works out which end it is on and gives both ends the same GRE key and /30 tunnel subnet, so nothing else has to match by hand. When the second server is done, it pings the first through the tunnel.
+It installs what is missing (`gcc`, `iptables`, `ethtool`, …), builds Golden GRE, and asks four things: **server 1's IP, server 2's IP**, the **disguise** (ICMP or DNS, Enter = ICMP; same on both servers), and whether to turn on [FEC](#-lossy-paths-fec) on this server. Type the same two IPs on both servers, in any order. The script works out which end it is on and gives both ends the same GRE key and /30 tunnel subnet, so nothing else has to match by hand. When the second server is done, it pings the first through the tunnel.
 
-After that, `golden-gre` opens the menu: new tunnel, manage tunnels (status with a live ping, start/stop/restart, FEC on/off, delete), live logs, update, uninstall.
+After that, `golden-gre` opens the menu: new tunnel, manage tunnels (status with a live ping, start/stop/restart, FEC on/off, disguise DNS/ICMP, delete), live logs, update, uninstall.
+
+Setup defaults to the ICMP disguise: it passed on every path measured so far, while the DNS disguise was cut after 6 packets per flow on one Iran–Germany path (where ICMP carried 557 Mbit/s for a 60-second download). On the path in [docs/FILTER.md](docs/FILTER.md) both passed and DNS was faster. If the ping through the tunnel stops after a few packets, or never answers, switch **both** servers to the other disguise in **Manage tunnels → Disguise**.
 
 - Run it as `bash <(…)`, not `curl … | bash`: the menu reads your answers from the terminal.
 - Not logged in as root? Run `sudo -i` first. `sudo bash <(…)` does not work: sudo closes the pipe the script comes through.
-- Behind 1:1 NAT (AWS, GCP, Oracle, …)? Type the **public** IPs. The script notices that neither one is on the server and asks which server it is on. Allow inbound UDP 53 from the other server in the provider's firewall.
-- Both servers print a **pair check** (GRE key and subnet). If the tunnel doesn't come up, compare the two: they must match.
+- Behind 1:1 NAT (AWS, GCP, Oracle, …)? Type the **public** IPs. The script notices that neither one is on the server and asks which server it is on. Allow the disguise in from the other server in the provider's firewall: ICMP, or UDP 53 for DNS.
+- Both servers print a **pair check** (GRE key, subnet and disguise). If the tunnel doesn't come up, compare the two: they must match.
 - No access to GitHub from the server? `git clone` the repo on a machine that has access, copy it over, and run `sudo ./golden-gre.sh` inside it.
 - Setup names each tunnel after its peer (`golden-gre@<peer IP>`, config `/etc/golden-gre/<peer IP>.conf`), so everything below applies to it too.
 

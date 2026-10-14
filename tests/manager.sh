@@ -58,28 +58,39 @@ ip -n "$B" addr add 192.0.2.2/24 dev veth-b
 for ns in "$A" "$B"; do ip -n "$ns" link set lo up; done
 ip -n "$A" link set veth-a up
 ip -n "$B" link set veth-b up
+# Many addresses on server 2: `ip addr` prints more than a pipe buffer, so a check that greps it through
+# a pipe and stops early (grep -q) kills ip, and pipefail read that as "address not on this host".
+for i in $(seq 1 150); do
+  ip -n "$B" link add "d$i" type dummy
+  ip -n "$B" addr add "10.200.$i.1/24" dev "d$i"
+done
 
 # `ip netns exec` bind-mounts /etc/netns/<ns>/golden-gre over /etc/golden-gre: one config dir per "server".
 mkdir -p /etc/golden-gre "/etc/netns/$A/golden-gre" "/etc/netns/$B/golden-gre"
 
 # The real setup dialog, answers on stdin. systemd runs units in the root namespace only, so start the
-# tunnel the way the unit does: device first, then the relay.
+# tunnel the way the setup and the unit do: preflight, device, then the relay.
 run_setup() { # namespace
   # shellcheck disable=SC2016 # expands in the inner shell
   ip netns exec "$1" bash -c '
     . ./golden-gre.sh
-    start_tunnel() { golden-gre-up.sh "$1" >/dev/null && { golden-gre-relay.sh "$1" >/dev/null 2>&1 & }; }
+    start_tunnel() {
+      preflight.sh "$1" >/dev/null || { preflight.sh "$1"; return 1; }
+      golden-gre-up.sh "$1" >/dev/null && { golden-gre-relay.sh "$1" >/dev/null 2>&1 & }
+    }
     setup_tunnel'
 }
 
-printf '192.0.2.1\n192.0.2.2\ny\n' | run_setup "$A" >"$tmp/a.out" 2>&1 || { cat "$tmp/a.out"; fail "setup failed on server 1"; }
+# Answers: server 1 IP, server 2 IP, disguise (Enter = the default, icmp), FEC.
+printf '192.0.2.1\n192.0.2.2\n\ny\n' | run_setup "$A" >"$tmp/a.out" 2>&1 || { cat "$tmp/a.out"; fail "setup failed on server 1"; }
 # Server 2 types the IPs in the other order on purpose.
-printf '192.0.2.2\n192.0.2.1\nn\n' | run_setup "$B" >"$tmp/b.out" 2>&1 || { cat "$tmp/b.out"; fail "setup failed on server 2"; }
+printf '192.0.2.2\n192.0.2.1\n\nn\n' | run_setup "$B" >"$tmp/b.out" 2>&1 || { cat "$tmp/b.out"; fail "setup failed on server 2"; }
 
 confA="/etc/netns/$A/golden-gre/192.0.2.2.conf" confB="/etc/netns/$B/golden-gre/192.0.2.1.conf"
 if ! { [ -r "$confA" ] && [ -r "$confB" ]; }; then fail "setup did not write the configs (want $confA and $confB)"; fi
 grep -qx 'FEC=10:5' "$confA" || fail "FEC=yes on server 1 did not write FEC=10:5"
 if grep -q '^FEC=' "$confB"; then fail "FEC=no on server 2 still wrote FEC"; fi
+for c in "$confA" "$confB"; do grep -qx 'FACADE=icmp' "$c" || fail "the default disguise did not write FACADE=icmp to $c"; done
 [ "$(grep '^GRE_KEY=' "$confA")" = "$(grep '^GRE_KEY=' "$confB")" ] || fail "the two configs have different GRE keys"
 grep -q 'answers' "$tmp/b.out" || { cat "$tmp/b.out"; fail "setup on server 2 did not report the peer answering"; }
 
@@ -108,21 +119,35 @@ U="golden-gre@192.0.2.1" CONF="$CONF_DIR/192.0.2.1.conf"
 src="$(src_for 192.0.2.1)"   # an unreachable documentation peer, as in tests/systemd.sh
 rm -f "$SELF"
 
-# first run: installs, sets up a tunnel (no FEC), exits
-printf '%s\n' y "$src" 192.0.2.1 n 0 | bash ./golden-gre.sh >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "first run failed"; }
+# first run: installs, sets up a tunnel (dns disguise, no FEC), exits
+printf '%s\n' y "$src" 192.0.2.1 2 n 0 | bash ./golden-gre.sh >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "first run failed"; }
 [ -x "$SELF" ] || fail "first run did not install the golden-gre command"
 systemctl is-active -q "$U" || { cat "$tmp/menu.out"; journalctl -u "$U" -n 20 --no-pager; fail "$U is not running after setup"; }
 systemctl is-enabled -q "$U" || fail "$U is not enabled at boot"
 ok "first run installs, sets up a tunnel, and systemd runs it"
 
 # manage -> tunnel 1 -> FEC on -> back, back, exit
-printf '%s\n' 2 1 7 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+printf '%s\n' 2 1 8 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
 grep -qx 'FEC=10:5' "$CONF" || { cat "$tmp/menu.out"; fail "FEC on did not reach the config"; }
 systemctl is-active -q "$U" || fail "$U is not running after the FEC restart"
 ok "FEC toggle writes the config and restarts the tunnel"
 
+# manage -> tunnel 1 -> disguise (dns -> icmp) -> back, back, exit
+rules() { iptables -S INPUT | grep -F "golden-gre:192.0.2.1" || true; }
+[[ $(rules) == *"--dport 53"* ]] || fail "no UDP 53 accept for the dns disguise before the switch"
+printf '%s\n' 2 1 7 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+grep -qx 'FACADE=icmp' "$CONF" || { cat "$tmp/menu.out"; fail "disguise switch did not write FACADE=icmp"; }
+systemctl is-active -q "$U" || fail "$U is not running after the disguise switch"
+[[ $(rules) == *"-p icmp"* ]] || fail "no ICMP accept after switching to icmp: $(rules)"
+[[ $(rules) != *"--dport 53"* ]] || fail "the dns disguise's UDP 53 accept was left behind: $(rules)"
+# and back to dns
+printf '%s\n' 2 1 7 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+grep -qx 'FACADE=dns' "$CONF" || fail "switching back did not write FACADE=dns"
+[[ $(rules) == *"--dport 53"* && $(rules) != *"-p icmp"* ]] || fail "wrong accept rules after switching back to dns: $(rules)"
+ok "disguise switch moves the tunnel between dns and icmp and swaps the firewall rule"
+
 # manage -> tunnel 1 -> delete, confirm -> exit
-printf '%s\n' 2 1 9 y 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+printf '%s\n' 2 1 10 y 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
 [ ! -e "$CONF" ] || fail "delete left $CONF"
 if systemctl is-active -q "$U" || systemctl is-enabled -q "$U" 2>/dev/null; then fail "delete left $U running or enabled"; fi
 ok "delete stops, disables and removes the tunnel"
