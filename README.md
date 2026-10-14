@@ -14,9 +14,9 @@
   <a href="https://github.com/LivingG0D/Golden-GRE/actions/workflows/ci.yml"><img src="https://github.com/LivingG0D/Golden-GRE/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
 
-<h3 align="center">🥇 GRE tunnels for IPv4 paths that cut tunnels — GRE rides inside a DNS-shaped relay, so it passes where GRE, WireGuard, QUIC and TCP tunnels are cut.</h3>
+<h3 align="center">🥇 GRE tunnels for IPv4 paths that cut tunnels — GRE rides inside a relay that makes it look like ping replies or DNS queries, so it passes where GRE, WireGuard, QUIC and TCP tunnels are cut.</h3>
 
-<p align="center"><i>A real <code>greN</code> L3 interface between Linux servers, tuned for loss, managed by systemd, measured at 140–160 Mbit/s on a path that kills every ordinary tunnel.</i></p>
+<p align="center"><i>A real <code>greN</code> L3 interface between Linux servers, tuned for loss, managed by systemd, measured at 500–690 Mbit/s Iran–Germany and 140–160 Mbit/s Iran–Turkey, on paths that kill every ordinary tunnel.</i></p>
 
 ---
 
@@ -24,11 +24,12 @@
 
 Some IPv4 paths between countries do not just drop GRE (IP protocol 47). They **cut every flow after the first few packets**: a tunnel comes up, a ping or two goes through, and then nothing — whether the packets are GRE, GRE-in-UDP (FOU), WireGuard, VXLAN, QUIC or a TCP stream. One measured path let through only **ICMP** and **UDP to port 53 that carries a valid DNS message**. [docs/FILTER.md](docs/FILTER.md) has the measurements for every method.
 
-**Golden GRE** keeps GRE as the tunnel (a real `greN` interface you route over) and carries it through a small **relay** that makes the wire traffic look like DNS queries to port 53 (or ICMP). To that path it is ordinary DNS; to your routing table it is a point-to-point link.
+**Golden GRE** keeps GRE as the tunnel (a real `greN` interface you route over) and carries it through a small **relay** that makes the wire traffic look like ICMP echo replies or DNS queries to port 53. To that path it is ordinary ping or DNS traffic; to your routing table it is a point-to-point link.
 
 On top of transport it ships the **production glue** a raw `ip tunnel` command leaves out:
 
-- 🥇 **Passes where native tunnels are cut** — measured 138 Mbit/s down / 153 up / 161 with four flows, 144 Mbit/s over a 5-minute soak, on a path where plain GRE, FOU, GUE, IPIP, VXLAN, Geneve and WireGuard carried nothing.
+- 🥇 **Passes where native tunnels are cut** — Iran–Germany with the ICMP disguise: 512–558 Mbit/s up, 520–691 down, ~606 averaged over a 60-second download. Iran–Turkey with the DNS disguise: 138 Mbit/s down / 153 up / 161 with four flows, 144 Mbit/s over a 5-minute soak, on a path where plain GRE, FOU, GUE, IPIP, VXLAN, Geneve and WireGuard carried nothing.
+- ⚡ **One-line setup** — [`golden-gre.sh`](#-easy-install-one-line) installs everything and builds a tunnel from just the two servers' IPs; a menu manages it afterwards.
 - ⚡ **Loss-tolerant by default** — BBR congestion control + `fq`, so a lossy long-haul path doesn't collapse TCP (CUBIC halves its window on every loss; BBR doesn't).
 - 🧱 **Forwarding-ready** — `ip_forward`, a FORWARD accept inserted ahead of Docker/ufw's DROP policy, and **TCP MSS clamping** so forwarded TCP never blackholes on PMTUD.
 - 🔁 **Reboot-persistent** — one **systemd template unit** (`golden-gre@<name>`) brings every tunnel back on boot and restarts it if the relay dies.
@@ -64,7 +65,14 @@ Each end runs the same recipe:
 3. The peer's relay checks the shape and the source address, unwraps it, and hands the datagram to its own FOU listener, which decapsulates the GRE.
 4. The kernel routes your traffic over `greN` like any other L3 interface.
 
-An **ICMP facade** (`FACADE=icmp`, unsolicited echo replies) is also built in. On the measured path it passed too, but reordered heavily at higher rates and was slower than DNS.
+The **ICMP facade** (`FACADE=icmp`) sends the same datagrams as unsolicited ICMP echo replies instead, with 36 bytes of overhead instead of 75. Which one passes depends on the path:
+
+| Path | `dns` | `icmp` |
+|------|-------|--------|
+| Iran–Turkey ([docs/FILTER.md](docs/FILTER.md)) | passes, 140–160 Mbit/s | passes, but reorders heavily at higher rates and is slower |
+| Iran–Germany (Hetzner) | **cut after 6 packets per flow** | passes, 500–690 Mbit/s, 0% ping loss |
+
+The [one-line setup](#-easy-install-one-line) defaults to `icmp`; the relay itself, and configs without `FACADE`, default to `dns`.
 
 ---
 
@@ -74,7 +82,7 @@ An **ICMP facade** (`FACADE=icmp`, unsolicited echo replies) is also built in. O
 - `iproute2`, `iptables`, `systemd`, and **`gcc`** (build time only: `install.sh` compiles the relay).
 - `ethtool` — turns GSO off on the tunnel device. **Install it.** The call is deliberately non-fatal, so without it the step is skipped silently, and with GSO on the kernel hands the relay datagrams of up to 64 KB.
 - Root on both ends.
-- **IPv4 only**, with one **public address per tunnel on each host**: the relay binds `LOCAL_PUB:53`, so tunnels that share a host need different `LOCAL_PUB` addresses (or a different `DNS_PORT`, if your path allows it).
+- **IPv4 only**, with one **public address per tunnel on each host**: the relay owns `LOCAL_PUB` (with the `dns` facade it binds `LOCAL_PUB:53`), so tunnels that share a host need different `LOCAL_PUB` addresses.
 - A free **/30** per tunnel for the overlay, and a unique **device name, `GRE_KEY`, `FOU_PORT` and `RELAY_PORT`** per tunnel on a shared host.
 
 Check modules:
@@ -97,7 +105,9 @@ It installs what is missing (`gcc`, `iptables`, `ethtool`, …), builds Golden G
 
 After that, `golden-gre` opens the menu: new tunnel, manage tunnels (status with a live ping, start/stop/restart, FEC on/off, disguise DNS/ICMP, delete), live logs, update, uninstall.
 
-Setup defaults to the ICMP disguise: it passed on every path measured so far, while the DNS disguise was cut after 6 packets per flow on one Iran–Germany path (where ICMP carried 557 Mbit/s for a 60-second download). On the path in [docs/FILTER.md](docs/FILTER.md) both passed and DNS was faster. If the ping through the tunnel stops after a few packets, or never answers, switch **both** servers to the other disguise in **Manage tunnels → Disguise**.
+Setup defaults to the ICMP disguise: it passed on every path measured so far, while the DNS disguise was cut after 6 packets per flow on an Iran–Germany path (where ICMP carried 500–690 Mbit/s). On the Iran–Turkey path in [docs/FILTER.md](docs/FILTER.md) both passed and DNS was faster. If the ping through the tunnel stops after a few packets, or never answers, switch **both** servers to the other disguise in **Manage tunnels → Disguise**.
+
+Setup writes `MTU=1380`, which fits any path. If `ping -M do -s 1472 <peer IP>` answers in both directions, the path carries full 1500-byte packets: add `MTU=1464` (ICMP) or `MTU=1425` (DNS) to `/etc/golden-gre/<peer IP>.conf` on both servers and restart the tunnel. On Iran–Germany that took upload from 512 to 558 Mbit/s.
 
 - Run it as `bash <(…)`, not `curl … | bash`: the menu reads your answers from the terminal.
 - Not logged in as root? Run `sudo -i` first. `sudo bash <(…)` does not work: sudo closes the pipe the script comes through.
@@ -187,9 +197,9 @@ One file per tunnel: `/etc/golden-gre/<name>.conf`. `<name>` is the systemd inst
 | `LOCAL_PUB` | ✅ | `203.0.113.10` | This server's public IPv4 address. The relay binds it. |
 | `REMOTE_PUB` | ✅ | `198.51.100.20` | Peer's public IPv4 address. |
 | `TUN_ADDR` | ✅ | `10.99.99.1/30` | This end's overlay address. Peer takes the other host in the /30. |
-| `FACADE` | ⬜ | `dns` | What the wire traffic looks like: `dns` (UDP/53, default) or `icmp`. Same on both ends. |
+| `FACADE` | ⬜ | `icmp` | What the wire traffic looks like: `dns` (UDP/53, the default when unset) or `icmp` (what the one-line setup writes by default). Same on both ends. |
 | `DNS_PORT` | ⬜ | `53` | `dns` facade: UDP port on both ends. Only 53 passed on the measured path. |
-| `MTU` | ⬜ | `1380` | Tunnel MTU. Default `1380`. Overhead on the wire is 75 bytes with the `dns` facade (20 IP + 8 UDP + 39 DNS + 8 GRE), 36 with `icmp`. |
+| `MTU` | ⬜ | `1464` | Tunnel MTU. Default `1380`. Overhead on the wire is 75 bytes with the `dns` facade (20 IP + 8 UDP + 39 DNS + 8 GRE), 36 with `icmp`, so a path that carries 1500-byte packets takes `1425` (dns) or `1464` (icmp). |
 | `GRE_KEY` | ⬜ | `41` | GRE key. **Must match on both ends.** Default `41`. Tunnels on one host need different keys (the kernel finds a tunnel by endpoints and key, and every tunnel here has the same loopback endpoints). |
 | `FEC` | ⬜ | `10:5` | Forward error correction on what **this end sends**: after every K packets the relay sends M Reed-Solomon parity packets, and the peer rebuilds up to M lost packets per block without waiting for TCP to resend them. Costs M/K extra bandwidth. Set it on the end that sends into the lossy direction; the peer decodes without any setting. See [Lossy paths](#-lossy-paths-fec). |
 | `RELAY_PORT` | ⬜ | `5601` | Loopback UDP port between the tunnel and the relay. **Unique per tunnel** on a host. |
@@ -324,6 +334,19 @@ NAT_SRC="10.99.99.4/30"
 
 Measured on one filtered path (round trip about 82 ms, a 2-vCPU server with 30–45% CPU steal on one end): single TCP flow 138 Mbit/s down and 153 up, 161 with four flows, 0.014% UDP loss, 144 Mbit/s averaged over five minutes. The relay and kernel together used about a quarter of the smaller server at 150 Mbit/s. Full tables: [docs/FILTER.md](docs/FILTER.md).
 
+Iran–Germany (round trip 79 ms, ICMP facade, `MTU` 1380 and 1464; a 4-vCPU server in Iran and a **1-vCPU** Hetzner server in Germany):
+
+| Test | Result |
+|------|--------|
+| TCP upload, 1 flow | 512–558 Mbit/s |
+| TCP download, 1 flow | 520–691 Mbit/s |
+| TCP download, 4 flows | 557–561 Mbit/s |
+| TCP download, 60 s | ~606 Mbit/s average, never cut |
+| UDP at 100 Mbit/s | 0–0.08% loss, <0.1 ms jitter |
+| UDP rate sweep (path capacity) | 690 Mbit/s at 1.2% loss, 825 at 7.8% |
+
+TCP gets about 80% of what the path carries. The rest is the path's loss above ~500 Mbit/s and the single core in Germany (up to 92% busy during a download). FEC did not help there: `20:2` rebuilt packets but gave 508–558 Mbit/s. A second vCPU on the busier end is the next step.
+
 ---
 
 ## 🔬 Verifying with iperf3
@@ -404,6 +427,7 @@ The relay logs `rebuilt=` every minute next to `tx`/`rx`; if it stays flat while
 
 | Symptom | Likely cause | Check / fix |
 |---------|--------------|-------------|
+| Ping through the tunnel answers a few times (often exactly 6), then stops; restarting the tunnel gives a few again | The path cuts this disguise per flow | Switch **both** ends to the other disguise: `golden-gre` → Manage tunnels → Disguise, or `FACADE=` in the config. |
 | Unit won't start: `… is not configured on this host yet` / `no route to …` | Early boot, or a wrong address | systemd retries every 5 s. If it persists, `LOCAL_PUB` is not an address of this host. |
 | `FOU port … is already in use` | Another tunnel holds that `FOU_PORT` | Give each tunnel on the host its own `FOU_PORT`, `RELAY_PORT` and `GRE_KEY`. |
 | Relay exits: `bind: Address already in use` | Something else holds `LOCAL_PUB:53` (another tunnel, a DNS server) | `ss -lun 'sport = :53'`; use another `LOCAL_PUB` or stop the other listener. `golden-gre-preflight <name>` reports it. |
