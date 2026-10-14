@@ -323,6 +323,8 @@ FORWARD="443 2053:2096 8080=80"   # 443 -> peer 443, 2053-2096 -> same ports, 80
 - Port 22 is refused, and the menu also refuses this server's actual SSH port and warns before taking a port a local program listens on.
 - The service on the peer sees connections from this end's tunnel address (`10.99.x.x`), not the client's address. It must listen on `0.0.0.0` or its tunnel address; with ufw on the peer, `ufw allow in on gre1`.
 - Forwarding is kernel NAT, so it costs nothing beyond the tunnel itself.
+- Changes apply to new connections. A UDP flow that is already running keeps its old path until it goes idle (or until you restart the service it talks to).
+- Earlier rules in the `nat` table's PREROUTING chain win: if Docker or a port-hopping setup (for example Hysteria) already redirects a port, forward a different one.
 
 **Use a node as an internet exit** (e.g. send the overlay's traffic out the USA box):
 

@@ -40,6 +40,7 @@ FWD_PORTS=() FWD_DEST=()
 if [ -n "${FORWARD:-}" ]; then
   fwd_bad() { echo "golden-gre: FORWARD entry '$1' $2 ($CONF)" >&2; exit 1; }
   if [ -n "${PEER_ADDR:-}" ]; then
+    [[ $PEER_ADDR =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "golden-gre: PEER_ADDR must be an IPv4 address ($CONF)" >&2; exit 1; }
     fwd_peer=$PEER_ADDR
   else
     ip4="${TUN_ADDR%/*}" last="${TUN_ADDR%/*}"; last="${last##*.}"
@@ -50,7 +51,7 @@ if [ -n "${FORWARD:-}" ]; then
     esac
   fi
   read -ra _fwd <<<"${FORWARD}"
-  for e in "${_fwd[@]}"; do
+  for e in ${_fwd[@]+"${_fwd[@]}"}; do
     if [[ $e =~ ^([0-9]{1,5})(:([0-9]{1,5}))?$ ]]; then
       lo=$(( 10#${BASH_REMATCH[1]} )) hi=$(( 10#${BASH_REMATCH[3]:-${BASH_REMATCH[1]}} )) to=''
     elif [[ $e =~ ^([0-9]{1,5})=([0-9]{1,5})$ ]]; then
@@ -177,7 +178,9 @@ if [ "${#FWD_PORTS[@]}" -gt 0 ]; then
         -m comment --comment "golden-gre-fwd:${NAME}" -j DNAT --to-destination "${FWD_DEST[i]}"
     done
   done
-  iptables -t nat -A POSTROUTING -o "${DEV}" -m conntrack --ctstate DNAT \
+  # Inserted, not appended: an earlier catch-all SNAT/ACCEPT in POSTROUTING would otherwise win, and the
+  # peer would answer by its own default route. The match is narrow enough to go first.
+  iptables -t nat -I POSTROUTING -o "${DEV}" -m conntrack --ctstate DNAT \
     -m comment --comment "golden-gre-fwd:${NAME}" -j MASQUERADE
 fi
 

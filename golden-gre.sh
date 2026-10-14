@@ -315,10 +315,16 @@ valid_forward() { # entry: well formed and not over port 22 (golden-gre-up.sh re
   fwd_range "$1" && (( FWD_LO > 22 || FWD_HI < 22 ))
 }
 set_forward() { # name "entries" — write FORWARD; restart a running tunnel so the rules follow
-  local conf="$CONF_DIR/$1.conf" v
-  local -a e
-  read -ra e <<<"$2"
-  v="${e[*]}"
+  local conf="$CONF_DIR/$1.conf" v cur
+  v=$(tr -s ' ' <<<" $2 "); v=${v# }; v=${v% }
+  cur=$(conf_get "$1" FORWARD)
+  if [ "$v" = "$cur" ]; then say "No change."; return 0; fi
+  if [ -n "$v" ] && [ -z "$(conf_get "$1" PEER_ADDR)" ]; then
+    case "$(conf_get "$1" TUN_ADDR)" in
+      */30 | */31) ;;
+      *) bad "Forwarding needs PEER_ADDR in $conf: its TUN_ADDR is not a /30 or /31."; return 1 ;;
+    esac
+  fi
   sed -i '/^FORWARD=/d' "$conf"
   if [ -n "$v" ]; then echo "FORWARD=\"$v\"" >>"$conf"; fi
   if systemctl is-active -q "golden-gre@$1"; then
@@ -327,16 +333,33 @@ set_forward() { # name "entries" — write FORWARD; restart a running tunnel so 
     good "Saved. Forwarded ports: ${v:-none} (applied when the tunnel starts)"
   fi
 }
+fwd_overlap() { # entry "entries" -> the first listed entry whose ports on this server overlap entry's
+  local lo hi x
+  local -a list
+  fwd_range "$1" || return 1
+  lo=$FWD_LO hi=$FWD_HI
+  read -ra list <<<"$2"
+  for x in ${list[@]+"${list[@]}"}; do
+    fwd_range "$x" || continue
+    if (( FWD_LO <= hi && lo <= FWD_HI )); then echo "$x"; return 0; fi
+  done
+  return 1
+}
 add_forwards() { # name
-  local n=$1 cur e p ok dev
-  local -a in=() add=() ssh_ports=() listening=()
-  cur=$(conf_get "$n" FORWARD)
+  local n=$1 cur e p ok dev lp relay='' add='' other
+  local -a in=() ssh_ports=() listening=()
+  cur=$(conf_get "$n" FORWARD) lp=$(conf_get "$n" LOCAL_PUB)
+  # The dns facade's own relay listens on LOCAL_PUB:DNS_PORT; the peer's traffic is never forwarded, so it stays.
+  [ "$(conf_get "$n" FACADE dns)" = icmp ] || relay=$(conf_get "$n" DNS_PORT 53)
   say "Examples: 443   2053:2096 (a range)   8080=80 (this server's 8080 to the peer's 80). Each is TCP and UDP."
   ask "Ports to add: "
   read -ra in <<<"$REPLY"
   mapfile -t ssh_ports < <({ echo 22; sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }'; } | sort -un)
-  mapfile -t listening < <(ss -Hltun 2>/dev/null | awk '{ n = split($5, a, ":"); print a[n] }' | sort -un)
-  for e in "${in[@]}"; do
+  # Only listeners the forwarding takes over: on LOCAL_PUB or on every address.
+  mapfile -t listening < <(ss -Hltun 2>/dev/null | awk -v lp="$lp" -v relay="$relay" '{
+      n = split($5, a, ":"); port = a[n]; addr = substr($5, 1, length($5) - length(port) - 1); sub(/%.*/, "", addr)
+      if ((addr == lp || addr == "0.0.0.0" || addr == "*" || addr == "[::]") && port != relay) print port }' | sort -un)
+  for e in ${in[@]+"${in[@]}"}; do
     if ! fwd_range "$e"; then bad "'$e' is not a port, a FIRST:LAST range, or PORT=PEER_PORT"; continue; fi
     ok=1
     for p in "${ssh_ports[@]}"; do
@@ -346,6 +369,11 @@ add_forwards() { # name
       fi
     done
     [ "$ok" = 1 ] || continue
+    if other=$(fwd_overlap "$e" "$cur $add"); then
+      bad "'$e' overlaps '$other', which is already forwarded. Remove that one first to change it. Skipped."
+      continue
+    fi
+    fwd_range "$e"
     for p in ${listening[@]+"${listening[@]}"}; do
       if (( FWD_LO <= p && p <= FWD_HI )); then
         yes_no "A program on this server listens on port $p; forwarding '$e' takes that port away from it. Forward anyway? [y/N] " n || ok=0
@@ -353,23 +381,24 @@ add_forwards() { # name
       fi
     done
     [ "$ok" = 1 ] || continue
-    [[ " $cur ${add[*]} " == *" $e "* ]] || add+=("$e")
+    add+=" $e"
   done
-  [ "${#add[@]}" -gt 0 ] || return 0
-  set_forward "$n" "$cur ${add[*]}"
+  [ -n "$add" ] || return 0
+  set_forward "$n" "$cur$add" || return
   dev=$(conf_get "$n" DEV)
   say "On $(conf_get "$n" REMOTE_PUB), the service must listen on those ports (on 0.0.0.0 or its tunnel IP)."
   say "If that server runs ufw, also run there: ufw allow in on $dev"
 }
 remove_forwards() { # name
-  local n=$1 cur e
-  local -a drop=() keep=()
+  local n=$1 cur e keep=''
+  local -a list=()
   cur=$(conf_get "$n" FORWARD)
   [ -n "$cur" ] || { say "No forwarded ports."; return 0; }
-  ask "Ports to remove, as listed ($cur): "
-  read -ra drop <<<"$REPLY"
-  for e in $cur; do [[ " ${drop[*]} " == *" $e "* ]] || keep+=("$e"); done
-  set_forward "$n" "${keep[*]}"
+  ask "Ports to remove, exactly as listed ($cur): "
+  read -ra list <<<"$cur"
+  for e in ${list[@]+"${list[@]}"}; do [[ " $REPLY " == *" $e "* ]] || keep+=" $e"; done
+  if [ "${keep# }" = "$cur" ]; then say "Nothing matched: type entries exactly as listed."; return 0; fi
+  set_forward "$n" "$keep"
 }
 forward_menu() { # name
   local n=$1
@@ -385,7 +414,8 @@ forward_menu() { # name
     case $REPLY in
       1) add_forwards "$n" ;;
       2) remove_forwards "$n" ;;
-      3) set_forward "$n" "" ;;
+      3) if [ -z "$(conf_get "$n" FORWARD)" ]; then say "No forwarded ports."
+         elif yes_no "Stop forwarding all ports? [y/N] " n; then set_forward "$n" ""; fi ;;
       0 | '') return ;;
     esac
   done

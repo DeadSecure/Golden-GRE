@@ -152,20 +152,24 @@ grep -qx 'FACADE=dns' "$CONF" || fail "switching back did not write FACADE=dns"
 [[ $(rules) == *"--dport 53"* && $(rules) != *"-p icmp"* ]] || fail "wrong accept rules after switching back to dns: $(rules)"
 ok "disguise switch moves the tunnel between dns and icmp and swaps the firewall rule"
 
-# manage -> tunnel 1 -> port forwarding: add, refuse 22, remove one, clear
-fwd_rules() { iptables -t nat -S PREROUTING | grep -cF -- "golden-gre-fwd:192.0.2.1" || true; }
-printf '%s\n' 2 1 9 1 '8443 2053:2096' 1 22 0 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+# manage -> tunnel 1 -> port forwarding: add, refuse 22 and an overlap, remove one, no-op remove, clear
+# Both nat chains, this tunnel's tag exactly (192.0.2.1 must not match 192.0.2.10).
+fwd_rules() { iptables -t nat -S | tr -d '"' | grep -c -- " --comment golden-gre-fwd:192\.0\.2\.1 " || true; }
+printf '%s\n' 2 1 9 1 '8443 2053:2096' 1 22 1 2060 0 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
 grep -qx 'FORWARD="8443 2053:2096"' "$CONF" || { cat "$tmp/menu.out"; fail "adding ports did not write FORWARD=\"8443 2053:2096\""; }
 grep -q 'SSH' "$tmp/menu.out" || { cat "$tmp/menu.out"; fail "refusing port 22 does not say why"; }
+grep -q "overlaps '2053:2096'" "$tmp/menu.out" || { cat "$tmp/menu.out"; fail "2060 inside 2053:2096 was not refused as an overlap"; }
 systemctl is-active -q "$U" || fail "$U is not running after adding ports"
-[ "$(fwd_rules)" = 4 ] || fail "want 4 DNAT rules (2 entries x tcp/udp), got $(fwd_rules)"
-printf '%s\n' 2 1 9 2 8443 0 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+[ "$(fwd_rules)" = 5 ] || fail "want 5 rules (2 entries x tcp/udp DNAT + 1 MASQUERADE), got $(fwd_rules)"
+printf '%s\n' 2 1 9 2 8443 2 9999 0 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
 grep -qx 'FORWARD="2053:2096"' "$CONF" || { cat "$tmp/menu.out"; fail "removing 8443 did not leave FORWARD=\"2053:2096\""; }
-[ "$(fwd_rules)" = 2 ] || fail "want 2 DNAT rules after removing one entry, got $(fwd_rules)"
-printf '%s\n' 2 1 9 3 0 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+grep -q 'Nothing matched' "$tmp/menu.out" || { cat "$tmp/menu.out"; fail "removing an unlisted port did not say nothing matched"; }
+[ "$(grep -c 'Restarted' "$tmp/menu.out")" = 1 ] || { cat "$tmp/menu.out"; fail "want exactly one restart (the real removal), not one for the no-op"; }
+[ "$(fwd_rules)" = 3 ] || fail "want 3 rules after removing one entry, got $(fwd_rules)"
+printf '%s\n' 2 1 9 3 y 0 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
 if grep -q '^FORWARD=' "$CONF"; then fail "remove all left a FORWARD line"; fi
-[ "$(fwd_rules)" = 0 ] || fail "remove all left $(fwd_rules) DNAT rules"
-ok "port forwarding menu adds, refuses 22, removes and clears ports, and the rules follow"
+[ "$(fwd_rules)" = 0 ] || fail "remove all left $(fwd_rules) forwarding rules"
+ok "port forwarding menu adds, refuses 22 and overlaps, removes (no restart when nothing matched) and clears; the rules follow"
 
 # manage -> tunnel 1 -> delete, confirm -> exit
 printf '%s\n' 2 1 11 y 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
