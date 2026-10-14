@@ -221,6 +221,8 @@ setup_tunnel() {
     say "The peer does not answer yet. That is normal until you run the same setup on $peer."
     say "If $peer is already set up: both servers must show the same pair check,"
     say "and each provider's firewall must let in UDP port 53 from the other server."
+    say "If the ping works for a few packets and then stops, the path cuts the DNS disguise:"
+    say "switch both servers to ICMP in 'Manage tunnels' (Disguise)."
   fi
 }
 
@@ -235,14 +237,14 @@ choose_tunnel() { # -> PICKED; status 1 for none or back
   mapfile -t names < <(tunnel_names)
   if [ ${#names[@]} -eq 0 ]; then say "No tunnels yet. Choose 'New tunnel' first."; return 1; fi
   say ""
-  printf '  %-3s %-16s %-32s %-10s %-6s %s\n' '#' TUNNEL 'TUNNEL IPs (this -> peer)' STATE FEC PING
+  printf '  %-3s %-16s %-32s %-10s %-9s %-6s %s\n' '#' TUNNEL 'TUNNEL IPs (this -> peer)' STATE DISGUISE FEC PING
   for i in "${!names[@]}"; do
     n=${names[i]}
     addr=$(conf_get "$n" TUN_ADDR)
     peer=$(conf_get "$n" PEER_ADDR "$(peer_of "$addr")")
-    printf '  %-3s %-16s %-32s %-10s %-6s %s\n' "$(( i + 1 ))" "$n" "${addr%/*} -> $peer" \
-      "$(systemctl is-active "golden-gre@$n" 2>/dev/null)" "$(conf_get "$n" FEC off)" \
-      "$(ping_ms "$(conf_get "$n" DEV)" "$peer")"
+    printf '  %-3s %-16s %-32s %-10s %-9s %-6s %s\n' "$(( i + 1 ))" "$n" "${addr%/*} -> $peer" \
+      "$(systemctl is-active "golden-gre@$n" 2>/dev/null)" "$(conf_get "$n" FACADE dns)" \
+      "$(conf_get "$n" FEC off)" "$(ping_ms "$(conf_get "$n" DEV)" "$peer")"
   done
   ask "Tunnel number (Enter = back): "
   [[ $REPLY =~ ^[0-9]+$ ]] && (( REPLY >= 1 && REPLY <= ${#names[@]} )) || return 1
@@ -270,15 +272,25 @@ toggle_fec() { # name
   fi
   if systemctl is-active -q "golden-gre@$1"; then systemctl restart "golden-gre@$1" && good "Restarted"; fi
 }
+toggle_disguise() { # name — what the wire traffic looks like: DNS queries to UDP 53, or ICMP echo replies
+  local conf="$CONF_DIR/$1.conf" new=icmp running=0
+  [ "$(conf_get "$1" FACADE dns)" = icmp ] && new=dns
+  # Stop before editing: the teardown removes the firewall rule of the disguise the tunnel started with.
+  if systemctl is-active -q "golden-gre@$1"; then running=1; systemctl stop "golden-gre@$1"; fi
+  sed -i '/^FACADE=/d' "$conf"
+  if [ "$new" = icmp ]; then echo "FACADE=icmp" >>"$conf"; fi
+  good "Disguise is now $new. Switch the other server to $new too: both ends must use the same one."
+  if [ "$running" = 1 ]; then systemctl start "golden-gre@$1" && good "Restarted"; fi
+}
 
 tunnel_menu() { # name
   local n=$1 peer
   while :; do
     peer=$(conf_get "$n" PEER_ADDR "$(peer_of "$(conf_get "$n" TUN_ADDR)")")
     say ""
-    say "${Y}Tunnel $n${N}: $(systemctl is-active "golden-gre@$n" 2>/dev/null), FEC $(conf_get "$n" FEC off)"
+    say "${Y}Tunnel $n${N}: $(systemctl is-active "golden-gre@$n" 2>/dev/null), disguise $(conf_get "$n" FACADE dns), FEC $(conf_get "$n" FEC off)"
     say "  1) Restart  2) Stop  3) Start  4) Ping test  5) Recent logs  6) Live logs"
-    say "  7) FEC on/off  8) Show settings  9) Delete  0) Back"
+    say "  7) FEC on/off  8) Disguise DNS/ICMP  9) Show settings  10) Delete  0) Back"
     ask "> "
     case $REPLY in
       1) systemctl restart "golden-gre@$n" && good "Restarted" ;;
@@ -289,8 +301,9 @@ tunnel_menu() { # name
       5) journalctl -u "golden-gre@$n" -n 50 --no-pager ;;
       6) follow_logs "$n" ;;
       7) toggle_fec "$n" ;;
-      8) cat "$CONF_DIR/$n.conf" ;;
-      9) if yes_no "Delete tunnel $n? It stops now and its settings are removed. [y/N] " n; then
+      8) toggle_disguise "$n" ;;
+      9) cat "$CONF_DIR/$n.conf" ;;
+      10) if yes_no "Delete tunnel $n? It stops now and its settings are removed. [y/N] " n; then
            remove_tunnel "$n"
            good "Deleted"
            return
@@ -389,7 +402,7 @@ main() {
     say ""
     say "${Y}=== Golden GRE ===${N}  tunnels: $(tunnel_names | wc -l), running: $(systemctl list-units --plain --no-legend --state=active 'golden-gre@*' 2>/dev/null | wc -l)"
     say "  1) New tunnel (asks for the two server IPs)"
-    say "  2) Manage tunnels (status, start/stop, FEC, delete)"
+    say "  2) Manage tunnels (status, start/stop, FEC, disguise, delete)"
     say "  3) Live logs"
     say "  4) Update Golden GRE"
     say "  5) Uninstall"

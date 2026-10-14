@@ -95,7 +95,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LivingG0D/Golden-GRE/main/go
 
 It installs what is missing (`gcc`, `iptables`, `ethtool`, …), builds Golden GRE, and asks three things: **server 1's IP, server 2's IP**, and whether to turn on [FEC](#-lossy-paths-fec) on this server. Type the same two IPs on both servers, in any order. The script works out which end it is on and gives both ends the same GRE key and /30 tunnel subnet, so nothing else has to match by hand. When the second server is done, it pings the first through the tunnel.
 
-After that, `golden-gre` opens the menu: new tunnel, manage tunnels (status with a live ping, start/stop/restart, FEC on/off, delete), live logs, update, uninstall.
+After that, `golden-gre` opens the menu: new tunnel, manage tunnels (status with a live ping, start/stop/restart, FEC on/off, disguise DNS/ICMP, delete), live logs, update, uninstall.
+
+Setup uses the DNS disguise. If the ping through the tunnel answers a few times and then stops, the path cuts that disguise: in **Manage tunnels → Disguise**, switch **both** servers to ICMP. On one Iran–Germany path the DNS disguise was cut after 6 packets per flow, while ICMP carried 557 Mbit/s for a 60-second download.
 
 - Run it as `bash <(…)`, not `curl … | bash`: the menu reads your answers from the terminal.
 - Not logged in as root? Run `sudo -i` first. `sudo bash <(…)` does not work: sudo closes the pipe the script comes through.
