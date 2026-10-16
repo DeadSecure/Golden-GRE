@@ -101,6 +101,20 @@ owner_of() { # KEY value [default] -> the first tunnel on this host whose KEY is
   done < <(tunnel_names)
   return 1
 }
+dns_owner_of() { # address -> the first tunnel on it with the dns disguise
+  local n
+  while read -r n; do
+    if [ "$(conf_get "$n" LOCAL_PUB)" = "$1" ] && [ "$(conf_get "$n" FACADE dns)" = dns ]; then echo "$n"; return 0; fi
+  done < <(tunnel_names)
+  return 1
+}
+same_address() { # name -> the other tunnels on its LOCAL_PUB
+  local n lp
+  lp=$(conf_get "$1" LOCAL_PUB)
+  while read -r n; do
+    if [ "$n" != "$1" ] && [ "$(conf_get "$n" LOCAL_PUB)" = "$lp" ]; then echo "$n"; fi
+  done < <(tunnel_names)
+}
 next_dev() {
   local i=1 taken
   taken=" $(used DEV '' | tr '\n' ' ') "
@@ -172,10 +186,6 @@ setup_tunnel() {
     yes_no "A tunnel to $peer already exists. Replace it? [y/N] " n || return 1
     remove_tunnel "$name"
   fi
-  if other=$(owner_of LOCAL_PUB "$lp"); then
-    bad "This server already has a tunnel on $lp (tunnel $other). Each tunnel needs its own public IP on this server: its relay owns that address. If you no longer need that tunnel, delete it in 'Manage tunnels' first."
-    return 1
-  fi
   pair_params "$s1" "$s2" "$me"
   if owner_of GRE_KEY "$PAIR_KEY" 41 >/dev/null \
     || grep -qxF "$(net_of "$PAIR_ADDR")" < <(used TUN_ADDR '' | while read -r a; do net_of "$a"; done); then
@@ -192,6 +202,11 @@ setup_tunnel() {
     2 | [dD]*) facade=dns ;;
     *) facade=icmp ;;
   esac
+  # Any number of icmp tunnels can share this address; a dns tunnel's relay owns LOCAL_PUB:53 alone.
+  if [ "$facade" = dns ] && other=$(dns_owner_of "$lp"); then
+    bad "This server already has a DNS tunnel on $lp (tunnel $other). Only one DNS tunnel fits on an address: pick ICMP, or use another public IP."
+    return 1
+  fi
 
   say ""
   say "FEC repairs lost packets. It adds 50% to the traffic this server sends."
@@ -288,8 +303,12 @@ toggle_fec() { # name
   if systemctl is-active -q "golden-gre@$1"; then systemctl restart "golden-gre@$1" && good "Restarted"; fi
 }
 toggle_disguise() { # name — what the wire traffic looks like: DNS queries to UDP 53, or ICMP echo replies
-  local conf="$CONF_DIR/$1.conf" new=icmp running=0
+  local conf="$CONF_DIR/$1.conf" new=icmp running=0 other
   [ "$(conf_get "$1" FACADE dns)" = icmp ] && new=dns
+  if [ "$new" = dns ] && other=$(dns_owner_of "$(conf_get "$1" LOCAL_PUB)"); then
+    bad "Tunnel $other already uses DNS on this public IP; only one DNS tunnel fits on an address. Kept ICMP."
+    return 1
+  fi
   # Stop before editing: the teardown removes the firewall rule of the disguise the tunnel started with.
   if systemctl is-active -q "golden-gre@$1"; then running=1; systemctl stop "golden-gre@$1"; fi
   sed -i '/^FACADE=/d' "$conf"
@@ -350,9 +369,10 @@ fwd_overlap() { # entry "entries" -> the first listed entry whose ports on this 
   return 1
 }
 add_forwards() { # name
-  local n=$1 cur e p ok dev lp relay='' add='' other
-  local -a in=() ssh_ports=() listening=()
+  local n=$1 cur e p o ok dev lp relay='' add='' other
+  local -a in=() ssh_ports=() listening=() shared=()
   cur=$(fwd_list "$n") lp=$(conf_get "$n" LOCAL_PUB)
+  mapfile -t shared < <(same_address "$n")
   # The dns facade's own relay listens on LOCAL_PUB:DNS_PORT; the peer's traffic is never forwarded, so it stays.
   [ "$(conf_get "$n" FACADE dns)" = icmp ] || relay=$(conf_get "$n" DNS_PORT 53)
   say "Separate ports with commas or spaces: 443,1080,2087. Also 2053:2096 (a range) and 8080=80 (this server's 8080 to the peer's 80). Each is TCP and UDP."
@@ -377,6 +397,14 @@ add_forwards() { # name
       bad "'$e' overlaps '$other', which is already forwarded. Remove that one first to change it. Skipped."
       continue
     fi
+    for o in ${shared[@]+"${shared[@]}"}; do
+      if other=$(fwd_overlap "$e" "$(fwd_list "$o")"); then
+        bad "'$e' overlaps '$other' on tunnel $o, which uses the same public IP. Skipped."
+        ok=0
+        break
+      fi
+    done
+    [ "$ok" = 1 ] || continue
     fwd_range "$e"
     for p in ${listening[@]+"${listening[@]}"}; do
       if (( FWD_LO <= p && p <= FWD_HI )); then

@@ -57,6 +57,8 @@ Both servers print a **pair check** (key, subnet, disguise) that must match. Whe
 
 Each tunnel is named after its peer: `golden-gre@<peer IP>`, config `/etc/golden-gre/<peer IP>.conf`.
 
+**Several destinations from one server:** run **New tunnel** again with the other peer's IP. Any number of ICMP tunnels can share this server's public IP; each relay gets only its own peer's packets from the kernel. A DNS tunnel needs the IP's UDP port 53 to itself, so there can be one DNS tunnel per IP next to the ICMP ones.
+
 ---
 
 ## 🛠 How it works
@@ -96,7 +98,7 @@ One file per tunnel, `/etc/golden-gre/<name>.conf`:
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `DEV` | required | Tunnel device, unique per host. |
-| `LOCAL_PUB` | required | This server's IPv4 address (the relay binds it). One per tunnel on a host. |
+| `LOCAL_PUB` | required | This server's IPv4 address (the relay binds it). Shared by any number of icmp tunnels; one dns tunnel per address. |
 | `REMOTE_PUB` | required | Peer's public IPv4 address. |
 | `TUN_ADDR` | required | This end's overlay address, e.g. `10.99.99.1/30`. |
 | `FACADE` | `dns` | `icmp` or `dns`. Same on both ends. The one-line setup writes `icmp`. |
@@ -167,7 +169,7 @@ On Iran–Kharej 1 (DNS disguise): 138 Mbit/s down, 153 up, 144 over a 5-minute 
 | Ping answers a few times (often 6), then stops | The path cuts the disguise. Switch both ends to the other one. |
 | Ping never answers | Same pair check on both servers? Provider firewall lets in ICMP / UDP 53 from the peer? |
 | `… is not configured on this host` | `LOCAL_PUB` is not an address of this host (systemd retries every 5 s at boot). |
-| `bind: Address already in use` | Something holds `LOCAL_PUB:53` (dns disguise). Use icmp or another `LOCAL_PUB`. |
+| `bind: Address already in use` | Something holds `LOCAL_PUB:53` (dns disguise): another dns tunnel or a DNS server. Use icmp or another `LOCAL_PUB`. |
 | `FOU port … is already in use` / `File exists` | Give each tunnel on a host its own `FOU_PORT`, `RELAY_PORT` and `GRE_KEY`. |
 | Bulk traffic slow in one direction | Measure loss per direction (`iperf3 -u -b 20M`, with and without `-R`); try `FEC` on the sending end. |
 | Forwarded TCP connects, then stalls | Lower `MTU`. |

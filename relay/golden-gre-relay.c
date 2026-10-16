@@ -25,6 +25,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <linux/filter.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -666,6 +667,16 @@ int main(int argc, char **argv) {
     setsockopt(rx, SOL_SOCKET, SO_RCVBUF, &big, sizeof big);
     setsockopt(rx, SOL_SOCKET, SO_SNDBUF, &big, sizeof big);
     peer = mkaddr(peer_ip, 0);
+    // A raw socket gets a copy of every ICMP packet to its address, so with several tunnels on one public
+    // address every relay would also wake for the others' traffic. Let the kernel keep only the peer's.
+    struct sock_filter only_peer[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 12),  // IPv4 source address
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ntohl(peer.sin_addr.s_addr), 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, 0xffffffff),
+        BPF_STMT(BPF_RET | BPF_K, 0),
+    };
+    struct sock_fprog prog = {(unsigned short)(sizeof only_peer / sizeof only_peer[0]), only_peer};
+    if (setsockopt(rx, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof prog) < 0) die("SO_ATTACH_FILTER");
   }
 
   if (reply_arg) {

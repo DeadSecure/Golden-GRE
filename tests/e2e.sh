@@ -18,12 +18,13 @@ ok(){ echo "ok: $*"; }
 
 A="gg-a-$$" B="gg-b-$$" C="gg-c-$$"
 CA="e2e-a-$$" CB="e2e-b-$$" CC="e2e-c-$$" CA2="e2e-a2-$$" CB2="e2e-b2-$$" CX="e2e-x-$$" CD="e2e-d-$$"
+S1="e2e-s1-$$" S2="e2e-s2-$$" SB1="e2e-sb1-$$" SB2="e2e-sb2-$$"
 tmp="$(mktemp -d)"
 pids=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
   for ns in "$A" "$B" "$C"; do ip netns del "$ns" 2>/dev/null || true; done
-  for c in "$CA" "$CB" "$CC" "$CA2" "$CB2" "$CX" "$CD"; do rm -f "/etc/golden-gre/$c.conf"; done
+  for c in "$CA" "$CB" "$CC" "$CA2" "$CB2" "$CX" "$CD" "$S1" "$S2" "$SB1" "$SB2"; do rm -f "/etc/golden-gre/$c.conf"; done
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -270,6 +271,43 @@ ip netns exec "$A" "$DOWN" "$CA2" >/dev/null
 ip netns exec "$B" "$DOWN" "$CB2" >/dev/null
 ip netns exec "$A" iptables-save | grep -q "golden-gre:$CA2" && fail "icmp INPUT rule left behind"
 ok "down removes the icmp rule"
+
+# --- several icmp tunnels on one public address, to different peers ------------
+# A's two tunnels share LOCAL_PUB 192.0.2.1; the peers are B's two addresses. Each relay must take
+# only its own peer's packets, and both tunnels must carry traffic at the same time.
+shared() { # name dev local remote tun key fou relay
+  cat >"/etc/golden-gre/$1.conf" <<EOF
+DEV=$2
+LOCAL_PUB=$3
+REMOTE_PUB=$4
+TUN_ADDR=$5
+FACADE=icmp
+GRE_KEY=$6
+FOU_PORT=$7
+RELAY_PORT=$8
+EOF
+}
+shared "$S1"  gs1 192.0.2.1  192.0.2.2  10.99.91.1/30 61 5611 5612
+shared "$S2"  gs2 192.0.2.1  192.0.2.12 10.99.92.1/30 62 5613 5614
+shared "$SB1" gs1 192.0.2.2  192.0.2.1  10.99.91.2/30 61 5611 5612
+shared "$SB2" gs2 192.0.2.12 192.0.2.1  10.99.92.2/30 62 5613 5614
+for c in "$S1" "$S2"; do ip netns exec "$A" "$UP" "$c" >/dev/null; start_relay "$A" "$c"; done
+for c in "$SB1" "$SB2"; do ip netns exec "$B" "$UP" "$c" >/dev/null; start_relay "$B" "$c"; done
+# Wait until both relays are up (the first packets can go out before they bind), then demand zero loss.
+for t in 10.99.91.2 10.99.92.2; do
+  ip netns exec "$A" ping -c 1 -w 5 -q "$t" >/dev/null || fail "tunnel to $t on a shared address never answered"
+done
+ip netns exec "$A" ping -c 40 -i 0.05 -W 2 -q 10.99.91.2 >"$tmp/s1.ping" 2>&1 & p1=$!
+ip netns exec "$A" ping -c 40 -i 0.05 -W 2 -q 10.99.92.2 >"$tmp/s2.ping" 2>&1 & p2=$!
+wait "$p1" || fail "tunnel 1 of 2 on a shared address lost pings: $(cat "$tmp/s1.ping")"
+wait "$p2" || fail "tunnel 2 of 2 on a shared address lost pings: $(cat "$tmp/s2.ping")"
+if ! { grep -q ' 0% packet loss' "$tmp/s1.ping" && grep -q ' 0% packet loss' "$tmp/s2.ping"; }; then
+  fail "shared-address tunnels dropped packets: $(cat "$tmp/s1.ping" "$tmp/s2.ping")"
+fi
+ok "two icmp tunnels on one public address carry traffic to two peers at the same time"
+kill "${pids[@]: -4}" 2>/dev/null || true
+for c in "$S1" "$S2"; do ip netns exec "$A" "$DOWN" "$c" >/dev/null; done
+for c in "$SB1" "$SB2"; do ip netns exec "$B" "$DOWN" "$c" >/dev/null; done
 
 # --- a bringup that fails partway must roll back everything it created --------
 # MTU is applied after the FOU listener, INPUT rule, device and address exist.
