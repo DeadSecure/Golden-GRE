@@ -53,7 +53,9 @@ if [ -n "$NAME" ]; then
         fi
         w "verify the path end-to-end with: tcpdump -ni any udp port ${port}  (run on the peer while this side sends)"
         ;;
-      icmp) w "verify the path end-to-end with: tcpdump -ni any icmp  (run on the peer while this side sends)" ;;
+      icmp)
+        case "${ICMP_TYPE:-0}" in 0 | 8) ;; *) b "ICMP_TYPE must be 0 (echo reply) or 8 (echo request)" ;; esac
+        w "verify the path end-to-end with: tcpdump -ni any icmp  (run on the peer while this side sends)" ;;
       *) b "FACADE must be dns or icmp" ;;
     esac
   else

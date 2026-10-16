@@ -21,7 +21,8 @@
 //
 // dns:  UDP from an ephemeral port to <peer>:53, framed as a DNS query (one question, EDNS0 OPT record
 //       whose RDATA is the payload); listens on <bind>:53 (--port).
-// icmp: ICMP messages of --itype (0 = unsolicited echo reply, so no kernel answers it); needs root.
+// icmp: ICMP messages of --itype: 0 = unsolicited echo reply, so no kernel answers it; 8 = echo request, for
+// paths that drop echo replies without a request (golden-gre-up.sh then drops the kernel's answers); needs root.
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -642,6 +643,7 @@ int main(int argc, char **argv) {
   // a random first block number, so the peer cannot mistake a restarted sender's blocks for old ones
   if (getrandom(&enc.id, sizeof enc.id, 0) != sizeof enc.id) enc.id = (uint32_t)now_ms();
   is_dns = !strcmp(facade, "dns");
+  if (!is_dns && itype != 0 && itype != 8) die("--itype must be 0 (echo reply) or 8 (echo request)");
   use_gso = is_dns && !strcmp(gso_arg, "on");
   // stop on SIGTERM/SIGINT after printing the counters (without SA_RESTART, so poll returns at once)
   struct sigaction sa = {.sa_handler = on_stop};
@@ -688,8 +690,8 @@ int main(int argc, char **argv) {
     struct sockaddr_in r = mkaddr(rip, atoi(rcolon + 1));
     set_reply(&r);
   }
-  printf("golden-gre-relay up: %s %s <-> %s, local %s, fec %s, gso %s, gf %s\n", facade, bind_ip, peer_ip, local,
-         fec_arg ? fec_arg : "off", use_gso ? "on" : "off", gf_impl);
+  printf("golden-gre-relay up: %s %s <-> %s, local %s, fec %s, gso %s, gf %s%s\n", facade, bind_ip, peer_ip, local,
+         fec_arg ? fec_arg : "off", use_gso ? "on" : "off", gf_impl, is_dns ? "" : itype ? ", itype 8" : ", itype 0");
   fflush(stdout);
 
   pthread_t out_thread, in_thread;

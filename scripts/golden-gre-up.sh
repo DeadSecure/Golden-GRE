@@ -32,6 +32,11 @@ case "${FACADE}" in
   dns | icmp) ;;
   *) echo "golden-gre: FACADE must be dns or icmp ($CONF)" >&2; exit 1 ;;
 esac
+ICMP_TYPE="${ICMP_TYPE:-0}"
+case "${ICMP_TYPE}" in
+  0 | 8) ;;
+  *) echo "golden-gre: ICMP_TYPE must be 0 (echo reply) or 8 (echo request) ($CONF)" >&2; exit 1 ;;
+esac
 
 # Port forwarding: FORWARD="443 2053:2096 8080=80" sends this host's public ports (TCP and UDP) through the
 # tunnel to the peer's overlay address: P to port P, A:B to the same ports, P=Q to port Q. Checked here,
@@ -120,6 +125,11 @@ else
 fi
 iptables -D INPUT "${WIRE[@]}" -s "${REMOTE_PUB}" -m comment --comment "golden-gre:${NAME}" -j ACCEPT 2>/dev/null || true
 iptables -I INPUT "${WIRE[@]}" -s "${REMOTE_PUB}" -m comment --comment "golden-gre:${NAME}" -j ACCEPT
+# With echo requests on the wire (ICMP_TYPE=8) the kernel would answer each one with an echo reply,
+# doubling the traffic to the peer. The relay then sends only requests, so drop every echo reply to the peer.
+ECHO_DROP=(-s "${LOCAL_PUB}" -d "${REMOTE_PUB}" -p icmp --icmp-type 0 -m comment --comment "golden-gre:${NAME}" -j DROP)
+iptables -D OUTPUT "${ECHO_DROP[@]}" 2>/dev/null || true
+if [ "${FACADE}" = icmp ] && [ "${ICMP_TYPE}" = 8 ]; then iptables -I OUTPUT "${ECHO_DROP[@]}"; fi
 
 # (re)create the tunnel device (idempotent). Both ends must use the same GRE_KEY; tunnels on one host
 # need different keys, FOU_PORT, RELAY_PORT and LOCAL_PUB.

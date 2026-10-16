@@ -16,6 +16,7 @@ RELAY="${GOLDEN_GRE_RELAY:-/usr/local/sbin/golden-gre-relay}"
 [ -x "$RELAY" ] || { echo "golden-gre: relay binary $RELAY not found (run install.sh)" >&2; exit 1; }
 
 # FEC=K:M adds M parity packets per K on what this end sends; the peer decodes without any setting.
+# ICMP_TYPE (icmp only): 0 sends echo replies, 8 echo requests; both ends must use the same.
 exec "$RELAY" --facade "${FACADE:-dns}" --bind "${LOCAL_PUB}" --peer "${REMOTE_PUB}" \
   --local "127.0.0.1:${RELAY_PORT:-5601}" --reply "127.0.0.1:${FOU_PORT:-5599}" --port "${DNS_PORT:-53}" \
-  ${FEC:+--fec "$FEC"}
+  --itype "${ICMP_TYPE:-0}" ${FEC:+--fec "$FEC"}
