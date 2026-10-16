@@ -94,15 +94,15 @@ run_setup() { # namespace
     setup_tunnel'
 }
 
-# Answers: server 1 IP, server 2 IP, disguise (Enter = the default, icmp), FEC.
-printf '192.0.2.1\n192.0.2.2\n\ny\n' | run_setup "$A" >"$tmp/a.out" 2>&1 || { cat "$tmp/a.out"; fail "setup failed on server 1"; }
+# Answers: server 1 IP, server 2 IP, disguise (Enter = the default, icmp). Setup does not ask about FEC.
+printf '192.0.2.1\n192.0.2.2\n\n' | run_setup "$A" >"$tmp/a.out" 2>&1 || { cat "$tmp/a.out"; fail "setup failed on server 1"; }
 # Server 2 types the IPs in the other order on purpose.
-printf '192.0.2.2\n192.0.2.1\n\nn\n' | run_setup "$B" >"$tmp/b.out" 2>&1 || { cat "$tmp/b.out"; fail "setup failed on server 2"; }
+printf '192.0.2.2\n192.0.2.1\n\n' | run_setup "$B" >"$tmp/b.out" 2>&1 || { cat "$tmp/b.out"; fail "setup failed on server 2"; }
 
 confA="/etc/netns/$A/golden-gre/192.0.2.2.conf" confB="/etc/netns/$B/golden-gre/192.0.2.1.conf"
 if ! { [ -r "$confA" ] && [ -r "$confB" ]; }; then fail "setup did not write the configs (want $confA and $confB)"; fi
-grep -qx 'FEC=10:5' "$confA" || fail "FEC=yes on server 1 did not write FEC=10:5"
-if grep -q '^FEC=' "$confB"; then fail "FEC=no on server 2 still wrote FEC"; fi
+if grep -q '^FEC=' "$confA" "$confB"; then fail "setup wrote FEC; it is off until turned on in Manage tunnels"; fi
+if grep -q 'Enable FEC' "$tmp/a.out" "$tmp/b.out"; then fail "setup still asks about FEC"; fi
 for c in "$confA" "$confB"; do grep -qx 'FACADE=icmp' "$c" || fail "the default disguise did not write FACADE=icmp to $c"; done
 [ "$(grep '^GRE_KEY=' "$confA")" = "$(grep '^GRE_KEY=' "$confB")" ] || fail "the two configs have different GRE keys"
 grep -q 'answers' "$tmp/b.out" || { cat "$tmp/b.out"; fail "setup on server 2 did not report the peer answering"; }
@@ -118,15 +118,15 @@ for i in 1 2 3 4 5; do
     "$i" "$i" "$i" "$i" "$i" >"/etc/netns/$A/golden-gre/zz$i.conf"
 done
 # Several tunnels on one public address: any number with icmp, at most one with dns (the dns relay
-# owns LOCAL_PUB:53). Answers: IPs, disguise (Enter = icmp, 2 = dns), FEC.
-printf '192.0.2.1\n192.0.2.9\n\nn\n' | run_setup "$A" >"$tmp/a2.out" 2>&1 || { cat "$tmp/a2.out"; fail "a second icmp tunnel on 192.0.2.1 was refused"; }
+# owns LOCAL_PUB:53). Answers: IPs, disguise (Enter = icmp, 2 = dns).
+printf '192.0.2.1\n192.0.2.9\n\n' | run_setup "$A" >"$tmp/a2.out" 2>&1 || { cat "$tmp/a2.out"; fail "a second icmp tunnel on 192.0.2.1 was refused"; }
 c9="/etc/netns/$A/golden-gre/192.0.2.9.conf"
 if ! { grep -qx 'LOCAL_PUB=192.0.2.1' "$c9" && grep -qx 'FACADE=icmp' "$c9"; }; then fail "second icmp tunnel config is wrong: $(cat "$c9")"; fi
 [ "$(grep '^DEV=' "$c9")" != "$(grep '^DEV=' "$confA")" ] || fail "second tunnel reuses the first one's device"
 ip netns exec "$A" ping -c 3 -W 2 -q "$peerB" >/dev/null || fail "adding a second icmp tunnel on the same address broke the first"
-printf '192.0.2.1\n192.0.2.8\n2\nn\n' | run_setup "$A" >"$tmp/a3.out" 2>&1 || { cat "$tmp/a3.out"; fail "a dns tunnel next to icmp ones was refused"; }
+printf '192.0.2.1\n192.0.2.8\n2\n' | run_setup "$A" >"$tmp/a3.out" 2>&1 || { cat "$tmp/a3.out"; fail "a dns tunnel next to icmp ones was refused"; }
 grep -qx 'FACADE=dns' "/etc/netns/$A/golden-gre/192.0.2.8.conf" || fail "the dns tunnel was not written with FACADE=dns"
-if printf '192.0.2.1\n192.0.2.7\n2\nn\n' | run_setup "$A" >"$tmp/a4.out" 2>&1; then
+if printf '192.0.2.1\n192.0.2.7\n2\n' | run_setup "$A" >"$tmp/a4.out" 2>&1; then
   fail "a second dns tunnel on the same public address was accepted"
 fi
 [ ! -e "/etc/netns/$A/golden-gre/192.0.2.7.conf" ] || fail "a refused setup still wrote its config"
@@ -159,7 +159,7 @@ src="$(src_for 192.0.2.1)"   # an unreachable documentation peer, as in tests/sy
 rm -f "$SELF"
 
 # first run: installs, sets up a tunnel (dns disguise, no FEC), exits
-printf '%s\n' y "$src" 192.0.2.1 2 n 0 | bash ./golden-gre.sh >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "first run failed"; }
+printf '%s\n' y "$src" 192.0.2.1 2 0 | bash ./golden-gre.sh >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "first run failed"; }
 [ -x "$SELF" ] || fail "first run did not install the golden-gre command"
 systemctl is-active -q "$U" || { cat "$tmp/menu.out"; journalctl -u "$U" -n 20 --no-pager; fail "$U is not running after setup"; }
 systemctl is-enabled -q "$U" || fail "$U is not enabled at boot"
