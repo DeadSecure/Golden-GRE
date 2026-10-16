@@ -47,6 +47,8 @@ systemctl enable "golden-gre-check@$N.timer"
 systemctl start "golden-gre@$N"
 systemctl is-active -q "golden-gre@$N" || fail "tunnel unit is not active after start"
 ip link show "$DEV" >/dev/null 2>&1 || fail "unit started but the tunnel device does not exist"
+# Type=simple: start returns once the relay process exists, which can be before it has bound its port.
+for _ in $(seq 50); do [ -n "$(ss -Hlun "sport = :${DNS_PORT}")" ] && break; sleep 0.1; done
 [ -n "$(ss -Hlun "sport = :${DNS_PORT}")" ] || fail "the relay is not listening on UDP $DNS_PORT"
 ok "unit runs the relay as its main process and builds the device"
 systemctl is-active -q "golden-gre-check@$N.timer" || fail "timer did not start with the tunnel"
