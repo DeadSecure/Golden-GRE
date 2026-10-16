@@ -42,7 +42,7 @@ esac
 if [ "${FACADE}" = icmp ]; then
   me="${LOCAL_PUB} ${REMOTE_PUB}"
   for f in "$(dirname "$CONF")"/*.conf; do
-    [ -r "$f" ] && [ "$f" != "$CONF" ] || continue
+    if [ ! -r "$f" ] || [ "$f" = "$CONF" ]; then continue; fi
     # shellcheck source=/dev/null
     other=$(unset FACADE LOCAL_PUB REMOTE_PUB ICMP_TYPE; . "$f" >/dev/null 2>&1
       [ "${FACADE:-dns} ${LOCAL_PUB:-} ${REMOTE_PUB:-}" = "icmp $me" ] && echo "${ICMP_TYPE:-0}") || true
