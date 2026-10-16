@@ -597,7 +597,15 @@ static void *wire_to_local(void *arg) {  // peer -> facade -> FEC -> tunnel
         len -= DNS_HDR;
       } else {
         size_t ihl = (p[0] & 15) * 4;
-        if (len <= ihl + ICMP_HDR || p[ihl] != itype || ((p[ihl + 4] << 8) | p[ihl + 5]) != IDENT) { ADD(nbad, 1); continue; }
+        if (len <= ihl + ICMP_HDR || ((p[ihl + 4] << 8) | p[ihl + 5]) != IDENT) { ADD(nbad, 1); continue; }
+        if (p[ihl] != itype) {  // the peer's relay with the other ICMP_TYPE: say so once instead of going quiet
+          static int warned;
+          if (!warned++)
+            fprintf(stderr, "golden-gre-relay: got ICMP type %d, ICMP_TYPE here is %d: set the same ICMP_TYPE on both ends\n",
+                    p[ihl], itype);
+          ADD(nbad, 1);
+          continue;
+        }
         p += ihl + ICMP_HDR;
         len -= ihl + ICMP_HDR;
       }
