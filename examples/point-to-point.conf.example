@@ -12,6 +12,7 @@ TUN_ADDR=10.99.99.1/30      # this end's overlay IP (peer = 10.99.99.2/30)
 
 # --- optional (defaults shown) ---
 # FACADE=dns                       # what the relay makes the wire traffic look like: dns (UDP/53) or icmp
+# ICMP_TYPE=0                      # icmp facade: 8 = echo requests, 0 = echo replies (same on both ends)
 # DNS_PORT=53                      # dns facade: UDP port on both ends
 # MTU=1380                         # tunnel MTU
 # FEC=10:5                         # parity on what this end sends: M per K packets (set on the side sending into loss)

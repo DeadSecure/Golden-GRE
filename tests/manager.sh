@@ -94,7 +94,7 @@ run_setup() { # namespace
     setup_tunnel'
 }
 
-# Answers: server 1 IP, server 2 IP, disguise (Enter = the default, icmp). Setup does not ask about FEC.
+# Answers: server 1 IP, server 2 IP, disguise (Enter = the default, ICMP requests). Setup does not ask about FEC.
 printf '192.0.2.1\n192.0.2.2\n\n' | run_setup "$A" >"$tmp/a.out" 2>&1 || { cat "$tmp/a.out"; fail "setup failed on server 1"; }
 # Server 2 types the IPs in the other order on purpose.
 printf '192.0.2.2\n192.0.2.1\n\n' | run_setup "$B" >"$tmp/b.out" 2>&1 || { cat "$tmp/b.out"; fail "setup failed on server 2"; }
@@ -103,7 +103,10 @@ confA="/etc/netns/$A/golden-gre/192.0.2.2.conf" confB="/etc/netns/$B/golden-gre/
 if ! { [ -r "$confA" ] && [ -r "$confB" ]; }; then fail "setup did not write the configs (want $confA and $confB)"; fi
 if grep -q '^FEC=' "$confA" "$confB"; then fail "setup wrote FEC; it is off until turned on in Manage tunnels"; fi
 if grep -q 'Enable FEC' "$tmp/a.out" "$tmp/b.out"; then fail "setup still asks about FEC"; fi
-for c in "$confA" "$confB"; do grep -qx 'FACADE=icmp' "$c" || fail "the default disguise did not write FACADE=icmp to $c"; done
+for c in "$confA" "$confB"; do
+  if ! { grep -qx 'FACADE=icmp' "$c" && grep -qx 'ICMP_TYPE=8' "$c"; }; then fail "the default disguise did not write FACADE=icmp and ICMP_TYPE=8 to $c"; fi
+done
+grep -q 'disguise icmp-request' "$tmp/a.out" || { cat "$tmp/a.out"; fail "the pair check does not name the disguise icmp-request"; }
 [ "$(grep '^GRE_KEY=' "$confA")" = "$(grep '^GRE_KEY=' "$confB")" ] || fail "the two configs have different GRE keys"
 grep -q 'answers' "$tmp/b.out" || { cat "$tmp/b.out"; fail "setup on server 2 did not report the peer answering"; }
 
@@ -118,10 +121,13 @@ for i in 1 2 3 4 5; do
     "$i" "$i" "$i" "$i" "$i" >"/etc/netns/$A/golden-gre/zz$i.conf"
 done
 # Several tunnels on one public address: any number with icmp, at most one with dns (the dns relay
-# owns LOCAL_PUB:53). Answers: IPs, disguise (Enter = icmp, 2 = dns).
+# owns LOCAL_PUB:53). Answers: IPs, disguise (Enter = ICMP requests, 2 = DNS, 3 = ICMP replies).
 printf '192.0.2.1\n192.0.2.9\n\n' | run_setup "$A" >"$tmp/a2.out" 2>&1 || { cat "$tmp/a2.out"; fail "a second icmp tunnel on 192.0.2.1 was refused"; }
 c9="/etc/netns/$A/golden-gre/192.0.2.9.conf"
 if ! { grep -qx 'LOCAL_PUB=192.0.2.1' "$c9" && grep -qx 'FACADE=icmp' "$c9"; }; then fail "second icmp tunnel config is wrong: $(cat "$c9")"; fi
+printf '192.0.2.1\n192.0.2.6\n3\n' | run_setup "$A" >"$tmp/a6.out" 2>&1 || { cat "$tmp/a6.out"; fail "an ICMP replies tunnel was refused"; }
+c6="/etc/netns/$A/golden-gre/192.0.2.6.conf"
+if ! grep -qx 'FACADE=icmp' "$c6" || grep -q '^ICMP_TYPE=8' "$c6"; then fail "disguise 3 did not write ICMP replies (FACADE=icmp, no ICMP_TYPE=8): $(cat "$c6")"; fi
 [ "$(grep '^DEV=' "$c9")" != "$(grep '^DEV=' "$confA")" ] || fail "second tunnel reuses the first one's device"
 ip netns exec "$A" ping -c 3 -W 2 -q "$peerB" >/dev/null || fail "adding a second icmp tunnel on the same address broke the first"
 printf '192.0.2.1\n192.0.2.8\n2\n' | run_setup "$A" >"$tmp/a3.out" 2>&1 || { cat "$tmp/a3.out"; fail "a dns tunnel next to icmp ones was refused"; }
@@ -143,7 +149,7 @@ grep -qx 'FORWARD="8443"' "/etc/netns/$A/golden-gre/192.0.2.8.conf" || { cat "$t
 ok "a port forwarded by another tunnel on the same address is refused, free ones are added"
 
 # shellcheck disable=SC2016 # expands in the inner shell
-if ip netns exec "$A" bash -c '. ./golden-gre.sh; systemctl() { return 1; }; toggle_disguise 192.0.2.9' >"$tmp/t.out" 2>&1; then
+if ip netns exec "$A" bash -c '. ./golden-gre.sh; systemctl() { return 1; }; set_disguise 192.0.2.9 dns' >"$tmp/t.out" 2>&1; then
   fail "switching to dns was allowed while another dns tunnel holds the address"
 fi
 grep -qx 'FACADE=icmp' "$c9" || fail "a refused disguise switch still changed the config"
@@ -171,19 +177,25 @@ grep -qx 'FEC=10:5' "$CONF" || { cat "$tmp/menu.out"; fail "FEC on did not reach
 systemctl is-active -q "$U" || fail "$U is not running after the FEC restart"
 ok "FEC toggle writes the config and restarts the tunnel"
 
-# manage -> tunnel 1 -> disguise (dns -> icmp) -> back, back, exit
+# manage -> tunnel 1 -> disguise -> 1 (ICMP requests) -> back, back, exit
 rules() { iptables -S INPUT | grep -F "golden-gre:192.0.2.1" || true; }
+echo_drop() { iptables -S OUTPUT | grep -F "golden-gre:192.0.2.1" || true; }
 [[ $(rules) == *"--dport 53"* ]] || fail "no UDP 53 accept for the dns disguise before the switch"
-printf '%s\n' 2 1 7 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
-grep -qx 'FACADE=icmp' "$CONF" || { cat "$tmp/menu.out"; fail "disguise switch did not write FACADE=icmp"; }
+printf '%s\n' 2 1 7 1 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+if ! { grep -qx 'FACADE=icmp' "$CONF" && grep -qx 'ICMP_TYPE=8' "$CONF"; }; then cat "$tmp/menu.out"; fail "switch to ICMP requests did not write FACADE=icmp and ICMP_TYPE=8"; fi
 systemctl is-active -q "$U" || fail "$U is not running after the disguise switch"
 [[ $(rules) == *"-p icmp"* ]] || fail "no ICMP accept after switching to icmp: $(rules)"
 [[ $(rules) != *"--dport 53"* ]] || fail "the dns disguise's UDP 53 accept was left behind: $(rules)"
-# and back to dns
-printf '%s\n' 2 1 7 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+[[ $(echo_drop) == *"--icmp-type 0"* ]] || fail "ICMP requests has no drop for the kernel's echo replies: $(echo_drop)"
+# -> 3 (ICMP replies): the echo-reply drop must go
+printf '%s\n' 2 1 7 3 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+if ! grep -qx 'FACADE=icmp' "$CONF" || grep -q '^ICMP_TYPE=8' "$CONF"; then cat "$tmp/menu.out"; fail "switch to ICMP replies left ICMP_TYPE=8"; fi
+[ -z "$(echo_drop)" ] || fail "ICMP replies left the echo-reply drop behind: $(echo_drop)"
+# -> 2 (DNS)
+printf '%s\n' 2 1 7 2 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
 grep -qx 'FACADE=dns' "$CONF" || fail "switching back did not write FACADE=dns"
 [[ $(rules) == *"--dport 53"* && $(rules) != *"-p icmp"* ]] || fail "wrong accept rules after switching back to dns: $(rules)"
-ok "disguise switch moves the tunnel between dns and icmp and swaps the firewall rule"
+ok "disguise menu moves the tunnel between ICMP requests, ICMP replies and DNS, and swaps the firewall rules"
 
 # manage -> tunnel 1 -> port forwarding: add, refuse 22 and an overlap, remove one, no-op remove, clear
 # Both nat chains, this tunnel's tag exactly (192.0.2.1 must not match 192.0.2.10).

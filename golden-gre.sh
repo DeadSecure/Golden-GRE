@@ -101,6 +101,30 @@ owner_of() { # KEY value [default] -> the first tunnel on this host whose KEY is
   done < <(tunnel_names)
   return 1
 }
+disguise_of() { # name -> icmp-request | icmp-reply | dns, from FACADE and ICMP_TYPE
+  if [ "$(conf_get "$1" FACADE dns)" = dns ]; then echo dns
+  elif [ "$(conf_get "$1" ICMP_TYPE 0)" = 8 ]; then echo icmp-request
+  else echo icmp-reply; fi
+}
+disguise_lines() { # disguise -> its config lines
+  case $1 in
+    dns) echo "FACADE=dns" ;;
+    icmp-reply) echo "FACADE=icmp" ;;
+    *) printf '%s\n' "FACADE=icmp" "ICMP_TYPE=8" ;;
+  esac
+}
+pick_disguise() { # -> DISGUISE (Enter = icmp-request)
+  say "  1) ICMP requests: ping requests. Passes paths that drop ping replies sent without a request."
+  say "  2) DNS:           queries to UDP port 53. Some paths cut it after a few packets."
+  say "  3) ICMP replies:  ping replies. The disguise of tunnels made before ICMP requests existed."
+  ask "Disguise? [1/2/3] (Enter = 1, ICMP requests) " 1
+  case $REPLY in
+    2 | [dD]*) DISGUISE=dns ;;
+    3) DISGUISE=icmp-reply ;;
+    *) DISGUISE=icmp-request ;;
+  esac
+}
+
 dns_owner_of() { # address -> the first tunnel on it with the dns disguise
   local n
   while read -r n; do
@@ -195,13 +219,8 @@ setup_tunnel() {
 
   say ""
   say "Disguise: what the tunnel's traffic looks like on the wire. Both servers must pick the same one."
-  say "  1) ICMP: ping replies. Passed on every path measured so far."
-  say "  2) DNS:  queries to UDP port 53. Some paths cut it after a few packets."
-  ask "Disguise? [1/2] (Enter = 1, ICMP) " 1
-  case $REPLY in
-    2 | [dD]*) facade=dns ;;
-    *) facade=icmp ;;
-  esac
+  pick_disguise
+  facade=$DISGUISE
   # Any number of icmp tunnels can share this address; a dns tunnel's relay owns LOCAL_PUB:53 alone.
   if [ "$facade" = dns ] && other=$(dns_owner_of "$lp"); then
     bad "This server already has a DNS tunnel on $lp (tunnel $other). Only one DNS tunnel fits on an address: pick ICMP, or use another public IP."
@@ -223,7 +242,7 @@ setup_tunnel() {
     echo "GRE_KEY=$PAIR_KEY"
     echo "FOU_PORT=$fou"
     echo "RELAY_PORT=$relay"
-    echo "FACADE=$facade"
+    disguise_lines "$facade"
   } >"$conf"
   good "Saved $conf"
 
@@ -247,7 +266,7 @@ setup_tunnel() {
       say "provider's firewall must let in ICMP (ping) from the other server."
     fi
     say "If the ping works for a few packets and then stops, or never works, the path cuts this"
-    say "disguise: switch both servers to the other one in 'Manage tunnels' (Disguise)."
+    say "disguise: switch both servers to another one in 'Manage tunnels' (Disguise)."
   fi
   say "FEC is off. If the path loses packets, turn it on later in 'Manage tunnels' (FEC)."
 }
@@ -263,13 +282,13 @@ choose_tunnel() { # -> PICKED; status 1 for none or back
   mapfile -t names < <(tunnel_names)
   if [ ${#names[@]} -eq 0 ]; then say "No tunnels yet. Choose 'New tunnel' first."; return 1; fi
   say ""
-  printf '  %-3s %-16s %-32s %-10s %-9s %-6s %s\n' '#' TUNNEL 'TUNNEL IPs (this -> peer)' STATE DISGUISE FEC PING
+  printf '  %-3s %-16s %-32s %-10s %-13s %-6s %s\n' '#' TUNNEL 'TUNNEL IPs (this -> peer)' STATE DISGUISE FEC PING
   for i in "${!names[@]}"; do
     n=${names[i]}
     addr=$(conf_get "$n" TUN_ADDR)
     peer=$(conf_get "$n" PEER_ADDR "$(peer_of "$addr")")
-    printf '  %-3s %-16s %-32s %-10s %-9s %-6s %s\n' "$(( i + 1 ))" "$n" "${addr%/*} -> $peer" \
-      "$(systemctl is-active "golden-gre@$n" 2>/dev/null)" "$(conf_get "$n" FACADE dns)" \
+    printf '  %-3s %-16s %-32s %-10s %-13s %-6s %s\n' "$(( i + 1 ))" "$n" "${addr%/*} -> $peer" \
+      "$(systemctl is-active "golden-gre@$n" 2>/dev/null)" "$(disguise_of "$n")" \
       "$(conf_get "$n" FEC off)" "$(ping_ms "$(conf_get "$n" DEV)" "$peer")"
   done
   ask "Tunnel number (Enter = back): "
@@ -298,17 +317,17 @@ toggle_fec() { # name
   fi
   if systemctl is-active -q "golden-gre@$1"; then systemctl restart "golden-gre@$1" && good "Restarted"; fi
 }
-toggle_disguise() { # name — what the wire traffic looks like: DNS queries to UDP 53, or ICMP echo replies
-  local conf="$CONF_DIR/$1.conf" new=icmp running=0 other
-  [ "$(conf_get "$1" FACADE dns)" = icmp ] && new=dns
+set_disguise() { # name disguise — what the wire traffic looks like: ICMP echo requests or replies, or DNS queries
+  local conf="$CONF_DIR/$1.conf" new=$2 running=0 other
+  if [ "$new" = "$(disguise_of "$1")" ]; then good "Disguise is already $new"; return 0; fi
   if [ "$new" = dns ] && other=$(dns_owner_of "$(conf_get "$1" LOCAL_PUB)"); then
-    bad "Tunnel $other already uses DNS on this public IP; only one DNS tunnel fits on an address. Kept ICMP."
+    bad "Tunnel $other already uses DNS on this public IP; only one DNS tunnel fits on an address. Kept $(disguise_of "$1")."
     return 1
   fi
-  # Stop before editing: the teardown removes the firewall rule of the disguise the tunnel started with.
+  # Stop before editing: the teardown removes the firewall rules of the disguise the tunnel started with.
   if systemctl is-active -q "golden-gre@$1"; then running=1; systemctl stop "golden-gre@$1"; fi
-  sed -i '/^FACADE=/d' "$conf"
-  echo "FACADE=$new" >>"$conf"
+  sed -i '/^FACADE=/d; /^ICMP_TYPE=/d' "$conf"
+  disguise_lines "$new" >>"$conf"
   good "Disguise is now $new. Switch the other server to $new too: both ends must use the same one."
   if [ "$running" = 1 ]; then systemctl start "golden-gre@$1" && good "Restarted"; fi
 }
@@ -453,7 +472,7 @@ tunnel_menu() { # name
   local n=$1 peer disguise fec
   while :; do
     peer=$(conf_get "$n" PEER_ADDR "$(peer_of "$(conf_get "$n" TUN_ADDR)")")
-    disguise=$(conf_get "$n" FACADE dns) fec=$(conf_get "$n" FEC off)
+    disguise=$(disguise_of "$n") fec=$(conf_get "$n" FEC off)
     say ""
     say "${Y}Tunnel $n${N}: $(systemctl is-active "golden-gre@$n" 2>/dev/null), disguise $disguise, FEC $fec"
     say "   1) Start"
@@ -462,7 +481,7 @@ tunnel_menu() { # name
     say "   4) Ping test"
     say "   5) Recent logs"
     say "   6) Live logs"
-    say "   7) Disguise: $disguise (switch to $([ "$disguise" = icmp ] && echo dns || echo icmp))"
+    say "   7) Disguise: $disguise (change)"
     say "   8) FEC: $fec (turn $([ "$fec" = off ] && echo on || echo off))"
     say "   9) Port forwarding: $(conf_get "$n" FORWARD none)"
     say "  10) Show settings"
@@ -477,7 +496,7 @@ tunnel_menu() { # name
       4) interruptible ping -c 5 -W 2 "$peer" ;;
       5) journalctl -u "golden-gre@$n" -n 50 --no-pager ;;
       6) follow_logs "$n" ;;
-      7) toggle_disguise "$n" ;;
+      7) pick_disguise; set_disguise "$n" "$DISGUISE" ;;
       8) toggle_fec "$n" ;;
       9) forward_menu "$n" ;;
       10) cat "$CONF_DIR/$n.conf" ;;

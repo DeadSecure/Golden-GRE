@@ -32,6 +32,9 @@ if [ -n "${REMOTE_PUB:-}" ]; then
     WIRE=(-p icmp)
   fi
   iptables -D INPUT "${WIRE[@]}" -s "${REMOTE_PUB}" -m comment --comment "golden-gre:${NAME}" -j ACCEPT 2>/dev/null || true
+  # ICMP_TYPE=8's drop of the kernel's echo replies; removed whatever the config says now.
+  iptables -D OUTPUT -s "${LOCAL_PUB:-0.0.0.0/0}" -d "${REMOTE_PUB}" -p icmp --icmp-type 0 \
+    -m comment --comment "golden-gre:${NAME}" -j DROP 2>/dev/null || true
 fi
 
 # Port forwarding rules, found by their tag, so they go even when FORWARD changed since up.

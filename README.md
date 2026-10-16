@@ -34,12 +34,13 @@ If Golden GRE helps you, you can support it:
 
 Some IPv4 paths between countries **cut every flow after the first few packets**: GRE, FOU, WireGuard, VXLAN, QUIC and plain TCP tunnels all come up and then go silent. One measured path let through only ICMP and UDP/53 carrying a valid DNS message ([docs/FILTER.md](docs/FILTER.md)).
 
-Golden GRE keeps GRE as the tunnel and carries it through a small relay that disguises each packet as an **ICMP echo reply** or a **DNS query**. To the path it is ping or DNS; to your routing table it is a point-to-point link. Around that it adds BBR tuning, forwarding and MSS clamping, optional FEC, port forwarding, a health check, and a menu.
+Golden GRE keeps GRE as the tunnel and carries it through a small relay that disguises each packet as an **ICMP echo request**, an **ICMP echo reply** or a **DNS query**. To the path it is ping or DNS; to your routing table it is a point-to-point link. Around that it adds BBR tuning, forwarding and MSS clamping, optional FEC, port forwarding, a health check, and a menu.
 
 | Path | `dns` disguise | `icmp` disguise |
 |------|----------------|-----------------|
 | Iran–Kharej 1 | passes, 140–160 Mbit/s | passes, slower (heavy reordering at high rates) |
 | Iran–Kharej 2 | **cut after 6 packets per flow** | passes, 500–690 Mbit/s |
+| Iran–Kharej 3 | **cut after a few packets** | echo replies from Iran **dropped** (requests pass): use ICMP requests |
 
 ---
 
@@ -54,7 +55,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LivingG0D/Golden-GRE/main/go
 It installs missing packages, builds Golden GRE, and asks:
 
 1. **Server 1's IP and server 2's IP.** Type the same two on both servers, in any order. The script works out which end it is on and gives both ends the same GRE key and /30.
-2. **Disguise:** Enter for ICMP (the default), or DNS. Same on both servers.
+2. **Disguise:** Enter for ICMP requests (the default), 2 for DNS, 3 for ICMP replies (what tunnels made before ICMP requests use). Same on both servers.
 
 FEC starts off; turn it on later in **Manage tunnels → FEC** if the path loses packets ([FEC](#-fec-for-lossy-paths)).
 
@@ -95,6 +96,7 @@ LOCAL_PUB=203.0.113.10
 REMOTE_PUB=198.51.100.20
 TUN_ADDR=10.99.99.1/30
 FACADE=icmp
+ICMP_TYPE=8
 EOF
 sudo systemctl enable --now golden-gre@link
 ping 10.99.99.2
@@ -113,6 +115,7 @@ One file per tunnel, `/etc/golden-gre/<name>.conf`:
 | `REMOTE_PUB` | required | Peer's public IPv4 address. |
 | `TUN_ADDR` | required | This end's overlay address, e.g. `10.99.99.1/30`. |
 | `FACADE` | `dns` | `icmp` or `dns`. Same on both ends. The one-line setup writes `icmp`. |
+| `ICMP_TYPE` | `0` | icmp only: `8` sends echo requests, `0` echo replies. Same on both ends. The one-line setup writes `8`. With `8`, this server stops answering pings from the peer's public IP (the kernel's replies would double the traffic). |
 | `MTU` | `1380` | If the path carries 1500-byte packets (`ping -M do -s 1472 <peer>` answers), use `1464` for icmp or `1425` for dns. |
 | `GRE_KEY` | `41` | Same on both ends; different per tunnel on a host. |
 | `FEC` | off | `K:M`: M parity packets per K on what this end sends. |
@@ -177,7 +180,8 @@ On Iran–Kharej 1 (DNS disguise): 138 Mbit/s down, 153 up, 144 over a 5-minute 
 
 | Symptom | Fix |
 |---------|-----|
-| Ping answers a few times (often 6), then stops | The path cuts the disguise. Switch both ends to the other one. |
+| Ping answers a few times (often 6), then stops | The path cuts the disguise. Switch both ends to another one. |
+| Plain ping between the servers works, the tunnel does not (icmp replies) | The path drops echo replies sent without a request. Switch both ends to ICMP requests. |
 | Ping never answers | Same pair check on both servers? Provider firewall lets in ICMP / UDP 53 from the peer? |
 | `… is not configured on this host` | `LOCAL_PUB` is not an address of this host (systemd retries every 5 s at boot). |
 | `bind: Address already in use` | Something holds `LOCAL_PUB:53` (dns disguise): another dns tunnel or a DNS server. Use icmp or another `LOCAL_PUB`. |

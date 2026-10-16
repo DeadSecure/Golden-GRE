@@ -267,10 +267,36 @@ ip netns exec "$A" iptables-save | grep -qF -- "-A INPUT -s 192.0.2.12/32 -p icm
   || fail "icmp facade has no peer-only icmp INPUT accept"
 ok "icmp facade carries traffic and opens icmp from the peer only"
 kill "${pids[@]: -2}" 2>/dev/null || true
+wait "${pids[@]: -2}" 2>/dev/null || true   # the next section's relays bind the same local port
 ip netns exec "$A" "$DOWN" "$CA2" >/dev/null
 ip netns exec "$B" "$DOWN" "$CB2" >/dev/null
 ip netns exec "$A" iptables-save | grep -q "golden-gre:$CA2" && fail "icmp INPUT rule left behind"
 ok "down removes the icmp rule"
+
+# --- ICMP_TYPE=8: the wire carries echo requests, for paths that drop unsolicited echo replies ------
+# The raw-table rule in A plays the filter: every echo reply reaching A on the underlay is dropped. Echo requests must
+# carry the tunnel, and B's kernel must not answer them (its replies would double the traffic).
+for c in "$CA2" "$CB2"; do echo 'ICMP_TYPE=8' >>"/etc/golden-gre/$c.conf"; done
+ip netns exec "$A" iptables -t raw -I PREROUTING -i veth-a -p icmp --icmp-type echo-reply -j DROP
+ip netns exec "$A" "$UP" "$CA2" >/dev/null
+ip netns exec "$B" "$UP" "$CB2" >/dev/null
+start_relay "$A" "$CA2"
+start_relay "$B" "$CB2"
+ip netns exec "$A" ping -c 1 -w 5 -q 10.99.97.2 >/dev/null || fail "ICMP_TYPE=8 tunnel never answered behind a filter that drops echo replies"
+ip netns exec "$A" ping -c 20 -i 0.05 -W 2 -q 10.99.97.2 >"$tmp/req.ping" 2>&1 || fail "ICMP_TYPE=8 tunnel lost pings: $(cat "$tmp/req.ping")"
+grep -q ' 0% packet loss' "$tmp/req.ping" || fail "ICMP_TYPE=8 tunnel lost pings: $(cat "$tmp/req.ping")"
+grep -q 'itype 8' "$tmp/relay-$CA2.log" || fail "ICMP_TYPE=8 did not reach the relay: $(cat "$tmp/relay-$CA2.log")"
+drops="$(ip netns exec "$A" iptables -t raw -L PREROUTING -vnx | awk '/echo-reply|type 0/ {print $1; exit}')"
+[ "$drops" = 0 ] || fail "B's kernel answered the relay's echo requests ($drops echo replies reached A)"
+ip netns exec "$B" iptables-save | grep -qF -- "-A OUTPUT -s 192.0.2.12/32 -d 192.0.2.11/32 -p icmp -m icmp --icmp-type 0 -m comment --comment \"golden-gre:$CB2\" -j DROP" \
+  || fail "ICMP_TYPE=8 has no OUTPUT drop for the kernel's echo replies to the peer"
+ok "ICMP_TYPE=8 carries the tunnel as echo requests, and no kernel echo replies leave for the peer"
+kill "${pids[@]: -2}" 2>/dev/null || true
+ip netns exec "$A" iptables -t raw -D PREROUTING -i veth-a -p icmp --icmp-type echo-reply -j DROP
+ip netns exec "$A" "$DOWN" "$CA2" >/dev/null
+ip netns exec "$B" "$DOWN" "$CB2" >/dev/null
+ip netns exec "$B" iptables-save | grep -q "golden-gre:$CB2" && fail "ICMP_TYPE=8 OUTPUT rule left behind"
+ok "down removes the echo-reply drop"
 
 # --- several icmp tunnels on one public address, to different peers ------------
 # A's two tunnels share LOCAL_PUB 192.0.2.1; the peers are B's two addresses. Each relay must take
