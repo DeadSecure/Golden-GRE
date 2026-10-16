@@ -22,20 +22,20 @@ if [ -n "${DEV:-}" ]; then
   ip link del "${DEV}" 2>/dev/null || true
 fi
 
-# The loopback FOU listener (each tunnel on a host uses its own port) and this tunnel's INPUT accept.
+# The loopback FOU listener (each tunnel on a host uses its own port) and this tunnel's INPUT accept
+# and ICMP_TYPE=8 echo-reply drop, by tag: they go even when the disguise or addresses changed since up.
 FOU_PORT="${FOU_PORT:-5599}"
 ip fou del port "${FOU_PORT}" local 127.0.0.1 2>/dev/null || ip fou del port "${FOU_PORT}" 2>/dev/null || true
-if [ -n "${REMOTE_PUB:-}" ]; then
-  if [ "${FACADE:-dns}" = dns ]; then
-    WIRE=(-p udp --dport "${DNS_PORT:-53}")
-  else
-    WIRE=(-p icmp)
-  fi
-  iptables -D INPUT "${WIRE[@]}" -s "${REMOTE_PUB}" -m comment --comment "golden-gre:${NAME}" -j ACCEPT 2>/dev/null || true
-  # ICMP_TYPE=8's drop of the kernel's echo replies; removed whatever the config says now.
-  iptables -D OUTPUT -s "${LOCAL_PUB:-0.0.0.0/0}" -d "${REMOTE_PUB}" -p icmp --icmp-type 0 \
-    -m comment --comment "golden-gre:${NAME}" -j DROP 2>/dev/null || true
-fi
+drop_tagged() { # this tunnel's INPUT/OUTPUT rules, found by their tag, so a changed address leaves none behind
+  local rule args
+  while read -r rule; do
+    rule=${rule//\"/}   # iptables -S quotes the comment; the tag has no spaces
+    [[ " $rule " == *" --comment golden-gre:${NAME} "* ]] || continue
+    read -ra args <<<"${rule/#-A /-D }"
+    iptables "${args[@]}" 2>/dev/null || true
+  done < <(iptables -S 2>/dev/null)
+}
+drop_tagged
 
 # Port forwarding rules, found by their tag, so they go even when FORWARD changed since up.
 while read -r rule; do

@@ -17,14 +17,14 @@ fail(){ echo "FAIL: $*" >&2; exit 1; }
 ok(){ echo "ok: $*"; }
 
 A="gg-a-$$" B="gg-b-$$" C="gg-c-$$"
-CA="e2e-a-$$" CB="e2e-b-$$" CC="e2e-c-$$" CA2="e2e-a2-$$" CB2="e2e-b2-$$" CX="e2e-x-$$" CD="e2e-d-$$"
+CA="e2e-a-$$" CB="e2e-b-$$" CC="e2e-c-$$" CA2="e2e-a2-$$" CB2="e2e-b2-$$" CX="e2e-x-$$" CD="e2e-d-$$" CM="e2e-m-$$"
 S1="e2e-s1-$$" S2="e2e-s2-$$" SB1="e2e-sb1-$$" SB2="e2e-sb2-$$"
 tmp="$(mktemp -d)"
 pids=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
   for ns in "$A" "$B" "$C"; do ip netns del "$ns" 2>/dev/null || true; done
-  for c in "$CA" "$CB" "$CC" "$CA2" "$CB2" "$CX" "$CD" "$S1" "$S2" "$SB1" "$SB2"; do rm -f "/etc/golden-gre/$c.conf"; done
+  for c in "$CA" "$CB" "$CC" "$CA2" "$CB2" "$CX" "$CD" "$CM" "$S1" "$S2" "$SB1" "$SB2"; do rm -f "/etc/golden-gre/$c.conf"; done
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -292,11 +292,69 @@ ip netns exec "$B" iptables-save | grep -qF -- "-A OUTPUT -s 192.0.2.12/32 -d 19
   || fail "ICMP_TYPE=8 has no OUTPUT drop for the kernel's echo replies to the peer"
 ok "ICMP_TYPE=8 carries the tunnel as echo requests, and no kernel echo replies leave for the peer"
 kill "${pids[@]: -2}" 2>/dev/null || true
+wait "${pids[@]: -2}" 2>/dev/null || true
 ip netns exec "$A" iptables -t raw -D PREROUTING -i veth-a -p icmp --icmp-type echo-reply -j DROP
 ip netns exec "$A" "$DOWN" "$CA2" >/dev/null
 ip netns exec "$B" "$DOWN" "$CB2" >/dev/null
 ip netns exec "$B" iptables-save | grep -q "golden-gre:$CB2" && fail "ICMP_TYPE=8 OUTPUT rule left behind"
 ok "down removes the echo-reply drop"
+
+# Ends with different ICMP_TYPE: nothing passes, and each relay says why instead of going quiet.
+sed -i 's/^ICMP_TYPE=8$/ICMP_TYPE=0/' "/etc/golden-gre/$CB2.conf"
+ip netns exec "$A" "$UP" "$CA2" >/dev/null
+ip netns exec "$B" "$UP" "$CB2" >/dev/null
+start_relay "$A" "$CA2"
+start_relay "$B" "$CB2"
+ip netns exec "$A" ping -c 3 -i 0.2 -W 1 -q 10.99.97.2 >/dev/null 2>&1 || true
+sleep 0.5
+grep -q 'got ICMP type 8, ICMP_TYPE here is 0' "$tmp/relay-$CB2.log" || fail "the relay did not report the peer's other ICMP_TYPE: $(cat "$tmp/relay-$CB2.log")"
+[ "$(grep -c 'ICMP_TYPE here' "$tmp/relay-$CB2.log")" = 1 ] || fail "the ICMP_TYPE mismatch was reported more than once"
+ok "a relay reports once when the peer uses the other ICMP_TYPE"
+kill "${pids[@]: -2}" 2>/dev/null || true
+wait "${pids[@]: -2}" 2>/dev/null || true
+ip netns exec "$A" "$DOWN" "$CA2" >/dev/null
+ip netns exec "$B" "$DOWN" "$CB2" >/dev/null
+sed -i 's/^ICMP_TYPE=0$/ICMP_TYPE=8/' "/etc/golden-gre/$CB2.conf"
+
+# The tunnel's own firewall rules go by their tag, even after LOCAL_PUB changed in the config.
+tagged() { ip netns exec "$B" iptables -S | tr -d '"' | grep -F -- " --comment golden-gre:$CB2 " || true; }
+ip netns exec "$B" "$UP" "$CB2" >/dev/null
+sed -i 's/^LOCAL_PUB=192.0.2.12$/LOCAL_PUB=192.0.2.2/' "/etc/golden-gre/$CB2.conf"
+ip netns exec "$B" "$UP" "$CB2" >/dev/null
+[[ $(tagged) != *"-s 192.0.2.12/32"* ]] || fail "a re-run after LOCAL_PUB changed left the old address's rule: $(tagged)"
+[[ $(tagged) == *"-s 192.0.2.2/32 -d 192.0.2.11/32"* ]] || fail "a re-run after LOCAL_PUB changed has no rule for the new address: $(tagged)"
+sed -i 's/^LOCAL_PUB=192.0.2.2$/LOCAL_PUB=192.0.2.12/' "/etc/golden-gre/$CB2.conf"
+ip netns exec "$B" "$DOWN" "$CB2" >/dev/null
+[ -z "$(tagged)" ] || fail "down after LOCAL_PUB changed left rules behind: $(tagged)"
+ok "rules are removed by the tunnel's tag, whatever the config's addresses are now"
+
+# Two icmp tunnels on one address pair must agree on ICMP_TYPE: the type-8 tunnel's drop of echo replies
+# to the peer would eat every packet of a type-0 one.
+ip netns exec "$B" "$UP" "$CB2" >/dev/null
+cat >"/etc/golden-gre/$CM.conf" <<'EOF'
+DEV=gre7
+LOCAL_PUB=192.0.2.12
+REMOTE_PUB=192.0.2.11
+TUN_ADDR=10.99.87.2/30
+FACADE=icmp
+GRE_KEY=77
+FOU_PORT=5631
+RELAY_PORT=5632
+EOF
+out="$(ip netns exec "$B" "$UP" "$CM" 2>&1)" && fail "up accepted icmp replies next to an ICMP_TYPE=8 tunnel on the same address pair"
+grep -q "$CB2" <<<"$out" || fail "refusing a mixed ICMP_TYPE pair does not name the other tunnel: $out"
+ip -n "$B" link show gre7 >/dev/null 2>&1 && fail "a refused mixed ICMP_TYPE bringup created its device"
+ip netns exec "$B" "$DOWN" "$CB2" >/dev/null
+ok "icmp tunnels on one address pair with different ICMP_TYPE are refused"
+
+# An ICMP_TYPE other than 0 or 8 is refused by up, preflight and the relay.
+sed -i 's/^ICMP_TYPE=8$/ICMP_TYPE=5/' "/etc/golden-gre/$CB2.conf"
+ip netns exec "$B" "$UP" "$CB2" >/dev/null 2>&1 && fail "up accepted ICMP_TYPE=5"
+ip netns exec "$B" scripts/preflight.sh "$CB2" >/dev/null 2>&1 && fail "preflight accepted ICMP_TYPE=5"
+"$tmp/relay" --facade icmp --bind 127.0.0.1 --peer 127.0.0.2 --local 127.0.0.1:5699 --itype 5 >/dev/null 2>&1 \
+  && fail "the relay accepted --itype 5"
+sed -i 's/^ICMP_TYPE=5$/ICMP_TYPE=8/' "/etc/golden-gre/$CB2.conf"
+ok "ICMP_TYPE other than 0 or 8 is refused by up, preflight and the relay"
 
 # --- several icmp tunnels on one public address, to different peers ------------
 # A's two tunnels share LOCAL_PUB 192.0.2.1; the peers are B's two addresses. Each relay must take
