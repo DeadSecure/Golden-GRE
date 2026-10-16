@@ -18,6 +18,16 @@
 
 <p align="center"><i>A real <code>greN</code> interface between two Linux servers, managed by systemd, set up with one command. Measured at 500–690 Mbit/s Iran–Kharej.</i></p>
 
+## 💛 Donate
+
+If Golden GRE helps you, you can support it:
+
+| Network | Address |
+|---------|---------|
+| TRON (TRX) | `TR3pJMPvNdACK2oNNgjyyDTPrzCvkoGg4L` |
+| USDT (BEP20) | `0xd360aEb1A32adcc3d5E1dFc043d68650C136D6D5` |
+| GRAM | `UQCeLZhcJUwY-7ymm1ZESdj1so91LGJNVcAG_KzGvZUnBOgR` |
+
 ---
 
 ## ✨ Why
