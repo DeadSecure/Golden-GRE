@@ -150,7 +150,7 @@ remove_tunnel() { # name — stop first: the unit's teardown reads the config
 }
 
 setup_tunnel() {
-  local s1 s2 me peer lp name conf fec='' facade dev fou relay hint other
+  local s1 s2 me peer lp name conf facade dev fou relay hint other
   local -a taken
   say ""
   say "${Y}New tunnel${N}: run this same setup on both servers, with the same two IPs."
@@ -208,10 +208,6 @@ setup_tunnel() {
     return 1
   fi
 
-  say ""
-  say "FEC repairs lost packets. It adds 50% to the traffic this server sends."
-  say "Turn it on for the server that sends INTO the lossy side: usually the foreign server, when downloads in Iran are slow."
-  if yes_no "Enable FEC on this server? [y/N] " n; then fec=$FEC_DEFAULT; fi
 
   dev=$(next_dev)
   mapfile -t taken < <(used FOU_PORT 5599; used RELAY_PORT 5601)
@@ -228,7 +224,6 @@ setup_tunnel() {
     echo "FOU_PORT=$fou"
     echo "RELAY_PORT=$relay"
     echo "FACADE=$facade"
-    if [ -n "$fec" ]; then echo "FEC=$fec"; fi
   } >"$conf"
   good "Saved $conf"
 
@@ -254,6 +249,7 @@ setup_tunnel() {
     say "If the ping works for a few packets and then stops, or never works, the path cuts this"
     say "disguise: switch both servers to the other one in 'Manage tunnels' (Disguise)."
   fi
+  say "FEC is off. If the path loses packets, turn it on later in 'Manage tunnels' (FEC)."
 }
 
 ping_ms() { # dev addr

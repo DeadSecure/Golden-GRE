@@ -55,7 +55,8 @@ It installs missing packages, builds Golden GRE, and asks:
 
 1. **Server 1's IP and server 2's IP.** Type the same two on both servers, in any order. The script works out which end it is on and gives both ends the same GRE key and /30.
 2. **Disguise:** Enter for ICMP (the default), or DNS. Same on both servers.
-3. **FEC on this server:** usually no. See [FEC](#-fec-for-lossy-paths).
+
+FEC starts off; turn it on later in **Manage tunnels → FEC** if the path loses packets ([FEC](#-fec-for-lossy-paths)).
 
 Both servers print a **pair check** (key, subnet, disguise) that must match. When the second server finishes, it pings the first through the tunnel. Later, `golden-gre` opens the menu: new tunnel, manage tunnels (status with live ping, start/stop/restart, disguise, FEC, port forwarding, delete), live logs, update, uninstall.
 
