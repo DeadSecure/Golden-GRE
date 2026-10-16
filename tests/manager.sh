@@ -117,12 +117,38 @@ for i in 1 2 3 4 5; do
   printf 'DEV=gre9%s\nLOCAL_PUB=192.0.2.7%s\nREMOTE_PUB=192.0.2.8%s\nTUN_ADDR=10.250.%s.1/30\nGRE_KEY=7%s\n' \
     "$i" "$i" "$i" "$i" "$i" >"/etc/netns/$A/golden-gre/zz$i.conf"
 done
-if printf '192.0.2.1\n192.0.2.9\nn\n' | run_setup "$A" >"$tmp/a2.out" 2>&1; then
-  fail "a second tunnel on the same public address was accepted"
+# Several tunnels on one public address: any number with icmp, at most one with dns (the dns relay
+# owns LOCAL_PUB:53). Answers: IPs, disguise (Enter = icmp, 2 = dns), FEC.
+printf '192.0.2.1\n192.0.2.9\n\nn\n' | run_setup "$A" >"$tmp/a2.out" 2>&1 || { cat "$tmp/a2.out"; fail "a second icmp tunnel on 192.0.2.1 was refused"; }
+c9="/etc/netns/$A/golden-gre/192.0.2.9.conf"
+if ! { grep -qx 'LOCAL_PUB=192.0.2.1' "$c9" && grep -qx 'FACADE=icmp' "$c9"; }; then fail "second icmp tunnel config is wrong: $(cat "$c9")"; fi
+[ "$(grep '^DEV=' "$c9")" != "$(grep '^DEV=' "$confA")" ] || fail "second tunnel reuses the first one's device"
+ip netns exec "$A" ping -c 3 -W 2 -q "$peerB" >/dev/null || fail "adding a second icmp tunnel on the same address broke the first"
+printf '192.0.2.1\n192.0.2.8\n2\nn\n' | run_setup "$A" >"$tmp/a3.out" 2>&1 || { cat "$tmp/a3.out"; fail "a dns tunnel next to icmp ones was refused"; }
+grep -qx 'FACADE=dns' "/etc/netns/$A/golden-gre/192.0.2.8.conf" || fail "the dns tunnel was not written with FACADE=dns"
+if printf '192.0.2.1\n192.0.2.7\n2\nn\n' | run_setup "$A" >"$tmp/a4.out" 2>&1; then
+  fail "a second dns tunnel on the same public address was accepted"
 fi
-[ ! -e "/etc/netns/$A/golden-gre/192.0.2.9.conf" ] || fail "a refused setup still wrote its config"
-grep -q 'already has a tunnel on 192.0.2.1' "$tmp/a2.out" || { cat "$tmp/a2.out"; fail "refusal does not say why"; }
-ok "a second tunnel on the same public address is refused"
+[ ! -e "/etc/netns/$A/golden-gre/192.0.2.7.conf" ] || fail "a refused setup still wrote its config"
+grep -q 'already has a DNS tunnel on 192.0.2.1 (tunnel 192.0.2.8)' "$tmp/a4.out" || { cat "$tmp/a4.out"; fail "dns refusal does not say why"; }
+ok "several icmp tunnels share a public address with at most one dns tunnel; the first keeps working"
+
+# A port forwarded by one tunnel on an address cannot be forwarded by another tunnel on it.
+echo 'FORWARD="443"' >>"$c9"
+# shellcheck disable=SC2016 # expands in the inner shell
+ip netns exec "$A" bash -c '. ./golden-gre.sh; systemctl() { return 1; }; add_forwards 192.0.2.8' \
+  <<<'443,8443' >"$tmp/f.out" 2>&1
+grep -q "overlaps '443' on tunnel 192.0.2.9" "$tmp/f.out" || { cat "$tmp/f.out"; fail "a port another tunnel on the same address forwards was not refused"; }
+grep -qx 'FORWARD="8443"' "/etc/netns/$A/golden-gre/192.0.2.8.conf" || { cat "$tmp/f.out"; fail "the free port was not added"; }
+ok "a port forwarded by another tunnel on the same address is refused, free ones are added"
+
+# shellcheck disable=SC2016 # expands in the inner shell
+if ip netns exec "$A" bash -c '. ./golden-gre.sh; systemctl() { return 1; }; toggle_disguise 192.0.2.9' >"$tmp/t.out" 2>&1; then
+  fail "switching to dns was allowed while another dns tunnel holds the address"
+fi
+grep -qx 'FACADE=icmp' "$c9" || fail "a refused disguise switch still changed the config"
+grep -q 'Tunnel 192.0.2.8 already uses DNS' "$tmp/t.out" || { cat "$tmp/t.out"; fail "refused switch does not say why"; }
+ok "switching to dns is refused while another dns tunnel holds the address"
 
 # --- the menu under real systemd: install, setup, FEC, delete, uninstall ------------------------------
 # It installs and then uninstalls Golden GRE on this host, so it runs only when asked (the CI runner).
