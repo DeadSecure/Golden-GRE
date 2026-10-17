@@ -17,14 +17,14 @@ fail(){ echo "FAIL: $*" >&2; exit 1; }
 ok(){ echo "ok: $*"; }
 
 A="gg-a-$$" B="gg-b-$$" C="gg-c-$$"
-CA="e2e-a-$$" CB="e2e-b-$$" CC="e2e-c-$$" CA2="e2e-a2-$$" CB2="e2e-b2-$$" CX="e2e-x-$$" CD="e2e-d-$$" CM="e2e-m-$$"
+CA="e2e-a-$$" CB="e2e-b-$$" CC="e2e-c-$$" CA2="e2e-a2-$$" CB2="e2e-b2-$$" CX="e2e-x-$$" CD="e2e-d-$$" CM="e2e-m-$$" R1="e2e-r1-$$" R2="e2e-r2-$$"
 S1="e2e-s1-$$" S2="e2e-s2-$$" SB1="e2e-sb1-$$" SB2="e2e-sb2-$$"
 tmp="$(mktemp -d)"
 pids=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
   for ns in "$A" "$B" "$C"; do ip netns del "$ns" 2>/dev/null || true; done
-  for c in "$CA" "$CB" "$CC" "$CA2" "$CB2" "$CX" "$CD" "$CM" "$S1" "$S2" "$SB1" "$SB2"; do rm -f "/etc/golden-gre/$c.conf"; done
+  for c in "$CA" "$CB" "$CC" "$CA2" "$CB2" "$CX" "$CD" "$CM" "$R1" "$R2" "$S1" "$S2" "$SB1" "$SB2"; do rm -f "/etc/golden-gre/$c.conf"; done
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -392,6 +392,60 @@ ok "two icmp tunnels on one public address carry traffic to two peers at the sam
 kill "${pids[@]: -4}" 2>/dev/null || true
 for c in "$S1" "$S2"; do ip netns exec "$A" "$DOWN" "$c" >/dev/null; done
 for c in "$SB1" "$SB2"; do ip netns exec "$B" "$DOWN" "$c" >/dev/null; done
+
+# --- dns facade on a path that passes only the first 6 packets of each flow ------------------------
+# connbytes in each host's mangle PREROUTING plays the filter (in INPUT it would sit below the tunnel's
+# own accept). Without SPORT_ROTATE one source port carries the whole tunnel and is cut; with
+# SPORT_ROTATE=5 every source port stays under the limit. DNS_PORTS is written with a space after the
+# comma, as the README allows. The .11/.12 pair: a relay of the first section may still hold .1/.2:53.
+rot() { # name local remote tun
+  cat >"/etc/golden-gre/$1.conf" <<EOF
+DEV=grr
+LOCAL_PUB=$2
+REMOTE_PUB=$3
+TUN_ADDR=$4
+GRE_KEY=71
+FOU_PORT=5621
+RELAY_PORT=5622
+DNS_PORTS="53, 853"
+RATE=3000
+EOF
+}
+rot "$R1" 192.0.2.11 192.0.2.12 10.99.81.1/30
+rot "$R2" 192.0.2.12 192.0.2.11 10.99.81.2/30
+CUT=(-p udp -m multiport --dports "53,853" -m connbytes --connbytes 7: --connbytes-dir original --connbytes-mode packets -j DROP)
+for ns in "$A" "$B"; do ip netns exec "$ns" iptables -t mangle -I PREROUTING "${CUT[@]}"; done
+ip netns exec "$A" "$UP" "$R1" >/dev/null || fail "up refused DNS_PORTS=\"53, 853\""
+ip netns exec "$B" "$UP" "$R2" >/dev/null || fail "up refused DNS_PORTS=\"53, 853\""
+for port in 53 853; do
+  ip netns exec "$A" iptables -S INPUT | grep -F "golden-gre:$R1" | grep -q "$port" || fail "DNS_PORTS: no INPUT accept for port $port"
+done
+start_relay "$A" "$R1"
+start_relay "$B" "$R2"
+ip netns exec "$A" ping -c 30 -i 0.05 -W 1 -q 10.99.81.2 >"$tmp/cut.ping" 2>&1 || true
+grep -q ' 0% packet loss' "$tmp/cut.ping" && fail "the simulated filter did not cut a single-port dns tunnel; the test proves nothing"
+kill "${pids[@]: -2}" 2>/dev/null || true
+wait "${pids[@]: -2}" 2>/dev/null || true
+for c in "$R1" "$R2"; do echo 'SPORT_ROTATE=5' >>"/etc/golden-gre/$c.conf"; done
+start_relay "$A" "$R1"
+start_relay "$B" "$R2"
+ip netns exec "$A" ping -c 1 -w 5 -q 10.99.81.2 >/dev/null || fail "SPORT_ROTATE=5 tunnel never answered behind a 6-packets-per-flow filter"
+ip netns exec "$A" ping -c 60 -i 0.05 -W 1 -q 10.99.81.2 >"$tmp/rot.ping" 2>&1 || fail "SPORT_ROTATE=5 tunnel lost pings: $(cat "$tmp/rot.ping")"
+grep -q ' 0% packet loss' "$tmp/rot.ping" || fail "SPORT_ROTATE=5 tunnel lost pings: $(cat "$tmp/rot.ping")"
+grep -q 'rotate 5, 2 ports, rate 3000' "$tmp/relay-$R1.log" || fail "SPORT_ROTATE, DNS_PORTS or RATE did not reach the relay: $(cat "$tmp/relay-$R1.log")"
+ok "SPORT_ROTATE keeps a dns tunnel alive on a path that cuts each flow after 6 packets; DNS_PORTS takes \"53, 853\""
+kill "${pids[@]: -2}" 2>/dev/null || true
+wait "${pids[@]: -2}" 2>/dev/null || true
+for ns in "$A" "$B"; do ip netns exec "$ns" iptables -t mangle -D PREROUTING "${CUT[@]}"; done
+ip netns exec "$A" "$DOWN" "$R1" >/dev/null
+ip netns exec "$B" "$DOWN" "$R2" >/dev/null
+ip netns exec "$A" iptables -S | grep -q "golden-gre:$R1" && fail "down left the DNS_PORTS accept behind"
+ip netns exec "$A" scripts/preflight.sh "$R1" >/dev/null || fail "preflight rejected a valid DNS_PORTS config"
+(ip netns exec "$A" python3 -c 'import socket,time; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(("192.0.2.11",853)); time.sleep(5)' &)
+sleep 0.5
+ip netns exec "$A" scripts/preflight.sh "$R1" >"$tmp/pf.out" 2>&1 && fail "preflight missed a busy port in DNS_PORTS: $(cat "$tmp/pf.out")"
+grep -q ':853 is already in use' "$tmp/pf.out" || fail "preflight does not name the busy DNS_PORTS port: $(cat "$tmp/pf.out")"
+ok "down removes the DNS_PORTS accept; preflight checks every port in DNS_PORTS"
 
 # --- a bringup that fails partway must roll back everything it created --------
 # MTU is applied after the FOU listener, INPUT rule, device and address exist.

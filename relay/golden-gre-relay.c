@@ -77,8 +77,19 @@ struct batch {
 };
 static struct batch from_local, from_wire;
 
-static int is_dns, itype, tx, rx, loc;
-static struct sockaddr_in peer;
+#define MAX_PORTS 8  // dns facade: the receiver may listen on several ports; see the --port list
+static int is_dns, itype, tx, loc;
+static int rxs[MAX_PORTS], nports = 1;       // the receive sockets (the dns facade may have several)
+static int peer_i;                           // which of peers[] the current tx socket sends to
+static struct sockaddr_in peers[MAX_PORTS];  // the peer addresses, one per port in the list
+static int rotate;                // dns only: reopen the sending socket every this many frames (0 = never)
+static unsigned long sockframes;  // frames sent on the current tx socket
+static struct sockaddr_in tx_bind;
+static int rate;                  // cap on wire frames per second (0 = unlimited)
+static double tokens;             // token bucket behind --rate
+static uint64_t token_ts;
+static struct sockaddr_in peer;  // the dns facade's tx thread rotates its port; the address never changes
+static in_addr_t peer_addr;       // the peer's address, for the rx thread's source check
 static struct sockaddr_in reply;  // where tunnel packets go; the wire -> local thread's own copy
 static unsigned seq;
 static unsigned long ntx, nrx, nbad, nrebuilt;
@@ -107,6 +118,20 @@ static int udp_socket(struct sockaddr_in a) {
   setsockopt(s, SOL_SOCKET, SO_SNDBUF, &big, sizeof big);
   if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) die("bind");
   return s;
+}
+
+// Reopen the sending socket with a fresh source port. Some paths allow only the first few packets of
+// each flow, and a source port is most of what tells the path one flow from the next; the receiver
+// keeps listening on its one port and accepts any source port. With several ports in the list, the
+// destination port rotates too, which multiplies the number of distinct flows by the list length.
+static void rotate_tx(void) {
+  close(tx);
+  tx = udp_socket(tx_bind);
+  sockframes = 0;
+  if (nports > 1) {
+    peer_i = (peer_i + 1) % nports;
+    peer = peers[peer_i];
+  }
 }
 
 static uint64_t now_ms(void) {
@@ -176,8 +201,13 @@ static void wire_flush(void) {
   if (!nw) return;
   if (!use_gso) {
     int sent = sendmmsg(tx, wmsg, nw, 0);
-    if (sent > 0) ADD(ntx, sent);
+    if (sent > 0) {
+      ADD(ntx, sent);
+      sockframes += sent;
+      if (rate) tokens -= sent;
+    }
     nw = 0;
+    if (rotate && sockframes >= (unsigned long)rotate) rotate_tx();
     return;
   }
   int ng = 0;
@@ -207,6 +237,8 @@ static void wire_flush(void) {
     if (sent > 0) {
       for (int k = j; k < j + sent; k++) {
         ADD(ntx, nseg[k]);
+        sockframes += nseg[k];
+        if (rate) tokens -= nseg[k];
         if (nseg[k] > 1) ADD(ngso, 1);
       }
       j += sent;
@@ -217,11 +249,16 @@ static void wire_flush(void) {
       fflush(stdout);
       use_gso = 0;
       int rest = sendmmsg(tx, wmsg + first[j], nw - first[j], 0);
-      if (rest > 0) ADD(ntx, rest);
+      if (rest > 0) {
+        ADD(ntx, rest);
+        sockframes += rest;
+        if (rate) tokens -= rest;
+      }
     }
     break;  // anything else (a full socket buffer): drop the rest, as a plain send would
   }
   nw = 0;
+  if (rotate && sockframes >= (unsigned long)rotate) rotate_tx();
 }
 
 // queue the frame a || b, wrapped in the facade
@@ -235,7 +272,8 @@ static void wire_emit(const uint8_t *a, size_t alen, const uint8_t *b, size_t bl
   else icmp_head(p - hdr, itype, seq, len);
   wiov[nw] = (struct iovec){p - hdr, hdr + len};
   wmsg[nw].msg_hdr = (struct msghdr){.msg_name = &peer, .msg_namelen = sizeof peer, .msg_iov = &wiov[nw], .msg_iovlen = 1};
-  if (++nw == OUTQ) wire_flush();
+  // Also flush at a rotation boundary, so one source port never carries more than --rotate frames.
+  if (++nw == OUTQ || (rotate && sockframes + (unsigned long)nw >= (unsigned long)rotate)) wire_flush();
 }
 
 static void local_flush(void) {
@@ -557,6 +595,18 @@ static void *local_to_wire(void *arg) {  // tunnel packets -> FEC -> facade -> p
       uint64_t age = now_ms() - enc.start;
       wait = age >= FLUSH_MS ? 0 : (int)(FLUSH_MS - age);
     }
+    if (rate) {  // token bucket: a short burst is fine, the sustained rate is what trips the path
+      uint64_t now = now_ms();
+      tokens += (double)(now - token_ts) * rate / 1000.0;
+      token_ts = now;
+      double cap = rate / 4.0;
+      if (tokens > cap) tokens = cap;
+      if (tokens < 1) {  // out of budget: sleep out the deficit instead of pulling more frames
+        struct timespec ts = {0, (long)(1000000.0 * (1 - tokens) / rate) + 100000};
+        nanosleep(&ts, NULL);
+        continue;
+      }
+    }
     if (poll(&pf, 1, wait) > 0 && (pf.revents & POLLIN)) {
       recv_setup(b, MAXPAY);
       int n = recvmmsg(loc, b->msgs, BATCH, MSG_DONTWAIT, NULL);
@@ -580,39 +630,46 @@ static void *local_to_wire(void *arg) {  // tunnel packets -> FEC -> facade -> p
 
 static void *wire_to_local(void *arg) {  // peer -> facade -> FEC -> tunnel
   struct batch *b = &from_wire;
-  struct pollfd pf = {rx, POLLIN, 0};
+  struct pollfd pf[MAX_PORTS];
   (void)arg;
+  for (int i = 0; i < nports; i++) pf[i] = (struct pollfd){rxs[i], POLLIN, 0};
   while (!GET(stopping)) {
-    if (poll(&pf, 1, 1000) <= 0 || !(pf.revents & POLLIN)) continue;
-    recv_setup(b, BUF);
-    int n = recvmmsg(rx, b->msgs, BATCH, MSG_DONTWAIT, NULL);
-    if (n <= 0 || !get_reply(&reply)) continue;  // nothing reaches the tunnel before its address is known
-    for (int i = 0; i < n; i++) {
-      uint8_t *p = b->bufs[i];
-      size_t len = b->msgs[i].msg_len;
-      if (b->names[i].sin_addr.s_addr != peer.sin_addr.s_addr) continue;
-      if (is_dns) {
-        if (len <= DNS_HDR || memcmp(p + 12, QUESTION, sizeof QUESTION)) { ADD(nbad, 1); continue; }
-        p += DNS_HDR;
-        len -= DNS_HDR;
-      } else {
-        size_t ihl = (p[0] & 15) * 4;
-        if (len <= ihl + ICMP_HDR || ((p[ihl + 4] << 8) | p[ihl + 5]) != IDENT) { ADD(nbad, 1); continue; }
-        if (p[ihl] != itype) {  // the peer's relay with the other ICMP_TYPE: say so once instead of going quiet
-          static int warned;
-          if (!warned++)
-            fprintf(stderr, "golden-gre-relay: got ICMP type %d, ICMP_TYPE here is %d: set the same ICMP_TYPE on both ends\n",
-                    p[ihl], itype);
-          ADD(nbad, 1);
-          continue;
+    if (poll(pf, nports, 1000) <= 0) continue;
+    int got = 0;
+    for (int k = 0; k < nports; k++) {
+      if (!(pf[k].revents & POLLIN)) continue;
+      recv_setup(b, BUF);
+      int n = recvmmsg(rxs[k], b->msgs, BATCH, MSG_DONTWAIT, NULL);
+      // Read even before the tunnel's address is known, and drop: unread data would keep poll returning.
+      if (n <= 0 || !get_reply(&reply)) continue;
+      got = 1;
+      for (int i = 0; i < n; i++) {
+        uint8_t *p = b->bufs[i];
+        size_t len = b->msgs[i].msg_len;
+        if (b->names[i].sin_addr.s_addr != peer_addr) continue;
+        if (is_dns) {
+          if (len <= DNS_HDR || memcmp(p + 12, QUESTION, sizeof QUESTION)) { ADD(nbad, 1); continue; }
+          p += DNS_HDR;
+          len -= DNS_HDR;
+        } else {
+          size_t ihl = (p[0] & 15) * 4;
+          if (len <= ihl + ICMP_HDR || ((p[ihl + 4] << 8) | p[ihl + 5]) != IDENT) { ADD(nbad, 1); continue; }
+          if (p[ihl] != itype) {  // the peer's relay with the other ICMP_TYPE: say so once instead of going quiet
+            static int warned;
+            if (!warned++)
+              fprintf(stderr, "golden-gre-relay: got ICMP type %d, ICMP_TYPE here is %d: set the same ICMP_TYPE on both ends\n",
+                      p[ihl], itype);
+            ADD(nbad, 1);
+            continue;
+          }
+          p += ihl + ICMP_HDR;
+          len -= ihl + ICMP_HDR;
         }
-        p += ihl + ICMP_HDR;
-        len -= ihl + ICMP_HDR;
+        if (p[0] == FEC_MAGIC) fec_input(p, len);
+        else local_emit(p, len);
       }
-      if (p[0] == FEC_MAGIC) fec_input(p, len);
-      else local_emit(p, len);
     }
-    local_flush();
+    if (got) local_flush();
   }
   return NULL;
 }
@@ -624,24 +681,40 @@ static void print_counters(void) {
 
 int main(int argc, char **argv) {
   const char *facade = NULL, *bind_ip = NULL, *peer_ip = NULL, *local = NULL, *reply_arg = NULL, *fec_arg = NULL;
-  const char *gso_arg = "on";
-  int port = 53;
+  const char *gso_arg = "on", *rotate_arg = NULL, *port_arg = "53", *rate_arg = NULL;
   for (int i = 1; i + 1 < argc; i += 2) {
     if (!strcmp(argv[i], "--facade")) facade = argv[i + 1];
     else if (!strcmp(argv[i], "--bind")) bind_ip = argv[i + 1];
     else if (!strcmp(argv[i], "--peer")) peer_ip = argv[i + 1];
     else if (!strcmp(argv[i], "--local")) local = argv[i + 1];
     else if (!strcmp(argv[i], "--reply")) reply_arg = argv[i + 1];
-    else if (!strcmp(argv[i], "--port")) port = atoi(argv[i + 1]);
+    else if (!strcmp(argv[i], "--port")) port_arg = argv[i + 1];
     else if (!strcmp(argv[i], "--itype")) itype = atoi(argv[i + 1]);
     else if (!strcmp(argv[i], "--fec")) fec_arg = argv[i + 1];
     else if (!strcmp(argv[i], "--gso")) gso_arg = argv[i + 1];
+    else if (!strcmp(argv[i], "--rotate")) rotate_arg = argv[i + 1];
+    else if (!strcmp(argv[i], "--rate")) rate_arg = argv[i + 1];
   }
   if (!facade || !bind_ip || !peer_ip || !local || (strcmp(facade, "dns") && strcmp(facade, "icmp")) ||
       (strcmp(gso_arg, "on") && strcmp(gso_arg, "off"))) {
-    fprintf(stderr, "usage: %s --facade dns|icmp --bind IP --peer IP --local IP:PORT [--reply IP:PORT] [--port 53] [--itype 0] [--fec K:M] [--gso on|off]\n", argv[0]);
+    fprintf(stderr, "usage: %s --facade dns|icmp --bind IP --peer IP --local IP:PORT [--reply IP:PORT] [--port 53,853,...] [--itype 0] [--fec K:M] [--gso on|off] [--rotate N] [--rate N]\n", argv[0]);
     return 1;
   }
+  if (rotate_arg) {
+    rotate = atoi(rotate_arg);
+    if (rotate < 0 || rotate > 64) {
+      fprintf(stderr, "--rotate needs 0..64 frames per source port (0 keeps a single port)\n");
+      return 1;
+    }
+  }
+  if (rate_arg) {
+    rate = atoi(rate_arg);
+    if (rate < 0 || rate > 200000) {
+      fprintf(stderr, "--rate needs 0..200000 frames per second (0 keeps it unlimited)\n");
+      return 1;
+    }
+  }
+  token_ts = now_ms();
   if (fec_arg && (sscanf(fec_arg, "%d:%d", &fec_k, &fec_m) != 2 || fec_k < 1 || fec_k > KMAX || fec_m < 1 || fec_m > MMAX)) {
     fprintf(stderr, "--fec needs K:M with 1 <= K, M <= %d\n", KMAX);
     return 1;
@@ -651,6 +724,7 @@ int main(int argc, char **argv) {
   // a random first block number, so the peer cannot mistake a restarted sender's blocks for old ones
   if (getrandom(&enc.id, sizeof enc.id, 0) != sizeof enc.id) enc.id = (uint32_t)now_ms();
   is_dns = !strcmp(facade, "dns");
+  if (rotate && !is_dns) die("--rotate is only for the dns facade");
   if (!is_dns && itype != 0 && itype != 8) die("--itype must be 0 (echo reply) or 8 (echo request)");
   use_gso = is_dns && !strcmp(gso_arg, "on");
   // stop on SIGTERM/SIGINT after printing the counters (without SA_RESTART, so poll returns at once)
@@ -665,17 +739,31 @@ int main(int argc, char **argv) {
 
   loc = udp_socket(mkaddr(lip, atoi(colon + 1)));
   if (is_dns) {
-    rx = udp_socket(mkaddr(bind_ip, port));
-    tx = udp_socket(mkaddr(bind_ip, 0));
-    peer = mkaddr(peer_ip, port);
+    char plist[256];
+    snprintf(plist, sizeof plist, "%s", port_arg);
+    nports = 0;
+    for (char *tok = strtok(plist, ", \t"); tok; tok = strtok(NULL, ", \t")) {
+      char *end;
+      long p = strtol(tok, &end, 10);
+      if (*end || p < 1 || p > 65535 || nports == MAX_PORTS)
+        die("--port wants 1..65535, comma or space separated, at most 8 ports");
+      rxs[nports] = udp_socket(mkaddr(bind_ip, (int)p));
+      peers[nports] = mkaddr(peer_ip, (int)p);
+      nports++;
+    }
+    if (!nports) die("--port wants at least one port");
+    tx_bind = mkaddr(bind_ip, 0);
+    tx = udp_socket(tx_bind);
+    peer_i = 0;
+    peer = peers[0];
   } else {
-    rx = tx = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (rx < 0) die("raw socket (root needed)");
+    rxs[0] = tx = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (rxs[0] < 0) die("raw socket (root needed)");
     struct sockaddr_in b = mkaddr(bind_ip, 0);
-    if (bind(rx, (struct sockaddr *)&b, sizeof b) < 0) die("bind");
+    if (bind(rxs[0], (struct sockaddr *)&b, sizeof b) < 0) die("bind");
     int big = 4 << 20;
-    setsockopt(rx, SOL_SOCKET, SO_RCVBUF, &big, sizeof big);
-    setsockopt(rx, SOL_SOCKET, SO_SNDBUF, &big, sizeof big);
+    setsockopt(rxs[0], SOL_SOCKET, SO_RCVBUF, &big, sizeof big);
+    setsockopt(rxs[0], SOL_SOCKET, SO_SNDBUF, &big, sizeof big);
     peer = mkaddr(peer_ip, 0);
     // A raw socket gets a copy of every ICMP packet to its address, so with several tunnels on one public
     // address every relay would also wake for the others' traffic. Let the kernel keep only the peer's.
@@ -686,9 +774,10 @@ int main(int argc, char **argv) {
         BPF_STMT(BPF_RET | BPF_K, 0),
     };
     struct sock_fprog prog = {(unsigned short)(sizeof only_peer / sizeof only_peer[0]), only_peer};
-    if (setsockopt(rx, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof prog) < 0) die("SO_ATTACH_FILTER");
+    if (setsockopt(rxs[0], SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof prog) < 0) die("SO_ATTACH_FILTER");
   }
 
+  peer_addr = peer.sin_addr.s_addr;
   if (reply_arg) {
     char rip[64];
     snprintf(rip, sizeof rip, "%s", reply_arg);
@@ -698,8 +787,12 @@ int main(int argc, char **argv) {
     struct sockaddr_in r = mkaddr(rip, atoi(rcolon + 1));
     set_reply(&r);
   }
-  printf("golden-gre-relay up: %s %s <-> %s, local %s, fec %s, gso %s, gf %s%s\n", facade, bind_ip, peer_ip, local,
-         fec_arg ? fec_arg : "off", use_gso ? "on" : "off", gf_impl, is_dns ? "" : itype ? ", itype 8" : ", itype 0");
+  char rot[64] = "";
+  if (rotate) snprintf(rot, sizeof rot, ", rotate %d", rotate);
+  if (nports > 1) snprintf(rot + strlen(rot), sizeof rot - strlen(rot), ", %d ports", nports);
+  if (rate) snprintf(rot + strlen(rot), sizeof rot - strlen(rot), ", rate %d", rate);
+  printf("golden-gre-relay up: %s %s <-> %s, local %s, fec %s, gso %s, gf %s%s%s\n", facade, bind_ip, peer_ip, local,
+         fec_arg ? fec_arg : "off", use_gso ? "on" : "off", gf_impl, is_dns ? "" : itype ? ", itype 8" : ", itype 0", rot);
   fflush(stdout);
 
   pthread_t out_thread, in_thread;

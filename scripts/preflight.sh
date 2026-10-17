@@ -45,13 +45,15 @@ if [ -n "$NAME" ]; then
     FACADE="${FACADE:-dns}"
     case "$FACADE" in
       dns)
-        port="${DNS_PORT:-53}"
-        if [ -n "$(ss -Hlun "sport = :${port}" "src ${LOCAL_PUB:-0.0.0.0}" 2>/dev/null)" ]; then
-          b "UDP ${LOCAL_PUB:-*}:${port} is already in use (another relay or a DNS server); use a different LOCAL_PUB or DNS_PORT"
-        else
-          g "UDP ${LOCAL_PUB:-*}:${port} is free for the relay"
-        fi
-        w "verify the path end-to-end with: tcpdump -ni any udp port ${port}  (run on the peer while this side sends)"
+        read -ra ports <<<"${DNS_PORTS:-${DNS_PORT:-53}}"; read -ra ports <<<"${ports[*]//,/ }"
+        for port in "${ports[@]}"; do
+          if [ -n "$(ss -Hlun "sport = :${port}" "src ${LOCAL_PUB:-0.0.0.0}" 2>/dev/null)" ]; then
+            b "UDP ${LOCAL_PUB:-*}:${port} is already in use (another relay or a DNS server); use a different LOCAL_PUB or DNS_PORT(S)"
+          else
+            g "UDP ${LOCAL_PUB:-*}:${port} is free for the relay"
+          fi
+        done
+        w "verify the path end-to-end with: tcpdump -ni any udp port ${ports[0]}  (run on the peer while this side sends)"
         ;;
       icmp)
         case "${ICMP_TYPE:-0}" in 0 | 8) ;; *) b "ICMP_TYPE must be 0 (echo reply) or 8 (echo request)" ;; esac
