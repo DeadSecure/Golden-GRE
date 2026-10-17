@@ -130,11 +130,16 @@ grep -q "port ${FOU_PORT} " < <(ip fou show 2>/dev/null) \
   || ip fou add port "${FOU_PORT}" ipproto 47 local 127.0.0.1
 
 # The relay's wire traffic takes packets from the peer only. Deleted and re-inserted so the rule sits
-# at the top of INPUT and opens the port on hosts whose INPUT policy is DROP (ufw). No DROP rule for
-# other sources: a local resolver may share the DNS port. The rule carries the instance name, so
+# at the top of INPUT and opens the port(s) on hosts whose INPUT policy is DROP (ufw). No DROP rule for
+# other sources: a local resolver may share a DNS port. The rule carries the instance name, so
 # tunnels sharing a peer each own (and later remove) their own.
 if [ "${FACADE}" = dns ]; then
-  WIRE=(-p udp --dport "${DNS_PORT}")
+  read -ra _ports <<<"${DNS_PORTS:-${DNS_PORT:-53}}"; read -ra _ports <<<"${_ports[*]//,/ }"   # commas and/or spaces
+  if [ "${#_ports[@]}" -eq 1 ]; then
+    WIRE=(-p udp --dport "${_ports[0]}")
+  else
+    WIRE=(-p udp -m multiport --dports "$(IFS=,; echo "${_ports[*]}")")
+  fi
 else
   WIRE=(-p icmp)
 fi

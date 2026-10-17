@@ -116,6 +116,8 @@ One file per tunnel, `/etc/golden-gre/<name>.conf`:
 | `TUN_ADDR` | required | This end's overlay address, e.g. `10.99.99.1/30`. |
 | `FACADE` | `dns` | `icmp` or `dns`. Same on both ends. The one-line setup writes `icmp`. |
 | `ICMP_TYPE` | `0` | icmp only: `8` sends echo requests, `0` echo replies. Same on both ends. The one-line setup writes `8`. With `8`, this server stops answering pings from the peer's public IP (the kernel's replies would double the traffic). |
+| `SPORT_ROTATE` | off | dns only: reopen the sending socket every N frames, so each source port carries at most N; a fresh source port is a fresh flow on a path that allows only the first few packets of each. Set it on the sending end. |
+| `RATE` | off | dns only: cap on frames per second put on the wire (a token bucket with a short burst allowed). Keeps sustained churn under what a filtering path accepts, so the tunnel stays smooth where an uncapped one gets clamped. Set it on the sending end. |
 | `MTU` | `1380` | If the path carries 1500-byte packets (`ping -M do -s 1472 <peer>` answers), use `1464` for icmp or `1425` for dns. |
 | `GRE_KEY` | `41` | Same on both ends; different per tunnel on a host. |
 | `FEC` | off | `K:M`: M parity packets per K on what this end sends. |
@@ -123,7 +125,7 @@ One file per tunnel, `/etc/golden-gre/<name>.conf`:
 | `ROUTES` | none | CIDRs to route via the tunnel. |
 | `NAT_SRC` / `NAT_OUT` | none | MASQUERADE this source out an interface (use the node as an exit). |
 | `FOU_PORT` / `RELAY_PORT` | `5599` / `5601` | Loopback ports, unique per tunnel on a host. |
-| `DNS_PORT` | `53` | UDP port for the `dns` disguise. |
+| `DNS_PORT` / `DNS_PORTS` | `53` | UDP port(s) for the `dns` disguise. `DNS_PORTS` takes a comma- or space-separated list (up to 8); several ports multiply the flows a rotating sender gets before it has to reuse one. Same list on both ends. |
 | `PEER_ADDR` | derived | Peer's overlay address, if `TUN_ADDR` is not a /30 or /31. |
 
 ### Managing

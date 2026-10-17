@@ -17,6 +17,12 @@ RELAY="${GOLDEN_GRE_RELAY:-/usr/local/sbin/golden-gre-relay}"
 
 # FEC=K:M adds M parity packets per K on what this end sends; the peer decodes without any setting.
 # ICMP_TYPE (icmp only): 0 sends echo replies, 8 echo requests; both ends must use the same.
+# SPORT_ROTATE (dns only): reopen the sending socket every N frames, so each source port carries at
+# most N; a fresh source port is a fresh flow on paths that allow only the first few packets per flow.
+# The icmp facade shares one raw socket for both directions and has no source port: rotation is off there.
+# RATE (dns only): cap on frames per second the relay puts on the wire; keeps sustained churn under
+# what the path accepts instead of getting clamped. Unset = no cap.
+[ "${FACADE:-dns}" = dns ] || SPORT_ROTATE=
 exec "$RELAY" --facade "${FACADE:-dns}" --bind "${LOCAL_PUB}" --peer "${REMOTE_PUB}" \
-  --local "127.0.0.1:${RELAY_PORT:-5601}" --reply "127.0.0.1:${FOU_PORT:-5599}" --port "${DNS_PORT:-53}" \
-  --itype "${ICMP_TYPE:-0}" ${FEC:+--fec "$FEC"}
+  --local "127.0.0.1:${RELAY_PORT:-5601}" --reply "127.0.0.1:${FOU_PORT:-5599}" --port "${DNS_PORTS:-${DNS_PORT:-53}}" \
+  --itype "${ICMP_TYPE:-0}" ${FEC:+--fec "$FEC"} ${SPORT_ROTATE:+--rotate "$SPORT_ROTATE"} ${RATE:+--rate "$RATE"}
