@@ -101,14 +101,16 @@ owner_of() { # KEY value [default] -> the first tunnel on this host whose KEY is
   done < <(tunnel_names)
   return 1
 }
-disguise_of() { # name -> icmp-request | icmp-reply | dns, from FACADE and ICMP_TYPE
-  if [ "$(conf_get "$1" FACADE dns)" = dns ]; then echo dns
+disguise_of() { # name -> icmp-request | icmp-reply | dns | none, from FACADE and ICMP_TYPE
+  local f
+  f=$(conf_get "$1" FACADE dns)
+  if [ "$f" != icmp ]; then echo "$f"
   elif [ "$(conf_get "$1" ICMP_TYPE 0)" = 8 ]; then echo icmp-request
   else echo icmp-reply; fi
 }
 disguise_lines() { # disguise -> its config lines
   case $1 in
-    dns) echo "FACADE=dns" ;;
+    dns | none) echo "FACADE=$1" ;;
     icmp-reply) echo "FACADE=icmp" ;;
     *) printf '%s\n' "FACADE=icmp" "ICMP_TYPE=8" ;;
   esac
@@ -117,10 +119,12 @@ pick_disguise() { # -> DISGUISE (Enter = icmp-request)
   say "  1) ICMP requests: ping requests. Passes paths that drop ping replies sent without a request."
   say "  2) DNS:           queries to UDP port 53. Some paths cut it after a few packets."
   say "  3) ICMP replies:  ping replies. The disguise of tunnels made before ICMP requests existed."
-  ask "Disguise? [1/2/3] (Enter = 1, ICMP requests) " 1
+  say "  4) None:          plain GRE, no relay. Fastest, but only where the path does not cut GRE."
+  ask "Disguise? [1/2/3/4] (Enter = 1, ICMP requests) " 1
   case $REPLY in
     2 | [dD]*) DISGUISE=dns ;;
     3) DISGUISE=icmp-reply ;;
+    4 | [nN]*) DISGUISE=none ;;
     *) DISGUISE=icmp-request ;;
   esac
 }
@@ -262,6 +266,8 @@ setup_tunnel() {
     say "If $peer is already set up: both servers must show the same pair check, and each"
     if [ "$facade" = dns ]; then
       say "provider's firewall must let in UDP port 53 from the other server."
+    elif [ "$facade" = none ]; then
+      say "provider's firewall must let in GRE (IP protocol 47) from the other server."
     else
       say "provider's firewall must let in ICMP (ping) from the other server."
     fi
@@ -311,6 +317,9 @@ toggle_fec() { # name
   if grep -q '^FEC=' "$conf"; then
     sed -i '/^FEC=/d' "$conf"
     good "FEC off"
+  elif [ "$(conf_get "$1" FACADE dns)" = none ]; then
+    bad "FEC runs in the relay, and a tunnel with no disguise has none. Pick a disguise first."
+    return 1
   else
     echo "FEC=$FEC_DEFAULT" >>"$conf"
     good "FEC on ($FEC_DEFAULT)"
@@ -389,7 +398,7 @@ add_forwards() { # name
   cur=$(fwd_list "$n") lp=$(conf_get "$n" LOCAL_PUB)
   mapfile -t shared < <(same_address "$n")
   # The dns facade's own relay listens on LOCAL_PUB:DNS_PORT; the peer's traffic is never forwarded, so it stays.
-  [ "$(conf_get "$n" FACADE dns)" = icmp ] || relay=$(conf_get "$n" DNS_PORT 53)
+  [ "$(conf_get "$n" FACADE dns)" != dns ] || relay=$(conf_get "$n" DNS_PORT 53)
   say "Separate ports with commas or spaces: 443,1080,2087. Also 2053:2096 (a range) and 8080=80 (this server's 8080 to the peer's 80). Each is TCP and UDP."
   ask "Ports to add: "
   read -ra in <<<"${REPLY//,/ }"

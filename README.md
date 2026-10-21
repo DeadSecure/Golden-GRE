@@ -55,7 +55,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LivingG0D/Golden-GRE/main/go
 It installs missing packages, builds Golden GRE, and asks:
 
 1. **Server 1's IP and server 2's IP.** Type the same two on both servers, in any order. The script works out which end it is on and gives both ends the same GRE key and /30.
-2. **Disguise:** Enter for ICMP requests (the default), 2 for DNS, 3 for ICMP replies (what tunnels made before ICMP requests use). Same on both servers.
+2. **Disguise:** Enter for ICMP requests (the default), 2 for DNS, 3 for ICMP replies (what tunnels made before ICMP requests use), 4 for none (plain GRE, no relay: fastest, but only where the path does not cut GRE). Same on both servers.
 
 FEC starts off; turn it on later in **Manage tunnels → FEC** if the path loses packets ([FEC](#-fec-for-lossy-paths)).
 
@@ -63,7 +63,7 @@ Both servers print a **pair check** (key, subnet, disguise) that must match. Whe
 
 - Not root? Run `sudo -i` first: `sudo bash <(…)` does not work. Use `bash <(…)`, not `curl … | bash`.
 - Behind 1:1 NAT (AWS, GCP, Oracle)? Type the **public** IPs; the script asks which server it is on.
-- The provider firewall must let in ICMP (or UDP 53 for DNS) from the other server.
+- The provider firewall must let in ICMP (UDP 53 for DNS, GRE for none) from the other server.
 - Ping answers a few times, then stops? The path cuts that disguise: switch **both** servers in **Manage tunnels → Disguise**.
 - No GitHub access on the server? Copy a clone over and run `sudo ./golden-gre.sh` inside it.
 
@@ -80,6 +80,8 @@ your packet ─► gre1 (GRE + key) ─► FOU on loopback ─► relay ─► w
 ```
 
 `golden-gre-up.sh` builds a `greN` device whose peer is loopback (GRE in FOU, sent to the local relay). `golden-gre-relay`, the systemd unit's main process, wraps each datagram in the disguise and sends it to the peer's relay, which checks the source address and shape, unwraps it and hands it back to the kernel. Overhead is 36 bytes with `icmp` and 75 with `dns`.
+
+With `FACADE=none` (no disguise) there is no relay and no FOU: `greN` is plain GRE between the two public IPs, 28 bytes of overhead, and the unit's main process only waits.
 
 ---
 
@@ -114,11 +116,11 @@ One file per tunnel, `/etc/golden-gre/<name>.conf`:
 | `LOCAL_PUB` | required | This server's IPv4 address (the relay binds it). Shared by any number of icmp tunnels; one dns tunnel per address. |
 | `REMOTE_PUB` | required | Peer's public IPv4 address. |
 | `TUN_ADDR` | required | This end's overlay address, e.g. `10.99.99.1/30`. |
-| `FACADE` | `dns` | `icmp` or `dns`. Same on both ends. The one-line setup writes `icmp`. |
+| `FACADE` | `dns` | `icmp`, `dns`, or `none` (plain GRE, no relay; `FEC`, `SPORT_ROTATE` and `RATE` do not apply). Same on both ends. The one-line setup writes `icmp`. |
 | `ICMP_TYPE` | `0` | icmp only: `8` sends echo requests, `0` echo replies. Same on both ends. The one-line setup writes `8`. With `8`, this server stops answering pings from the peer's public IP (the kernel's replies would double the traffic). |
 | `SPORT_ROTATE` | off | dns only: reopen the sending socket every N frames, so each source port carries at most N; a fresh source port is a fresh flow on a path that allows only the first few packets of each. Set it on the sending end. |
 | `RATE` | off | dns only: cap on frames per second put on the wire (a token bucket with a short burst allowed). Keeps sustained churn under what a filtering path accepts, so the tunnel stays smooth where an uncapped one gets clamped. Set it on the sending end. |
-| `MTU` | `1380` | If the path carries 1500-byte packets (`ping -M do -s 1472 <peer>` answers), use `1464` for icmp or `1425` for dns. |
+| `MTU` | `1380` | If the path carries 1500-byte packets (`ping -M do -s 1472 <peer>` answers), use `1464` for icmp, `1425` for dns or `1472` for none. |
 | `GRE_KEY` | `41` | Same on both ends; different per tunnel on a host. |
 | `FEC` | off | `K:M`: M parity packets per K on what this end sends. |
 | `FORWARD` | none | Ports to forward to the peer, comma- or space-separated: `"443,1080,2053:2096,8080=80"`. |
