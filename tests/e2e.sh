@@ -18,13 +18,13 @@ ok(){ echo "ok: $*"; }
 
 A="gg-a-$$" B="gg-b-$$" C="gg-c-$$"
 CA="e2e-a-$$" CB="e2e-b-$$" CC="e2e-c-$$" CA2="e2e-a2-$$" CB2="e2e-b2-$$" CX="e2e-x-$$" CD="e2e-d-$$" CM="e2e-m-$$" R1="e2e-r1-$$" R2="e2e-r2-$$"
-S1="e2e-s1-$$" S2="e2e-s2-$$" SB1="e2e-sb1-$$" SB2="e2e-sb2-$$"
+S1="e2e-s1-$$" S2="e2e-s2-$$" SB1="e2e-sb1-$$" SB2="e2e-sb2-$$" P1="e2e-p1-$$" P2="e2e-p2-$$"
 tmp="$(mktemp -d)"
 pids=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
   for ns in "$A" "$B" "$C"; do ip netns del "$ns" 2>/dev/null || true; done
-  for c in "$CA" "$CB" "$CC" "$CA2" "$CB2" "$CX" "$CD" "$CM" "$R1" "$R2" "$S1" "$S2" "$SB1" "$SB2"; do rm -f "/etc/golden-gre/$c.conf"; done
+  for c in "$CA" "$CB" "$CC" "$CA2" "$CB2" "$CX" "$CD" "$CM" "$R1" "$R2" "$S1" "$S2" "$SB1" "$SB2" "$P1" "$P2"; do rm -f "/etc/golden-gre/$c.conf"; done
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -392,6 +392,41 @@ ok "two icmp tunnels on one public address carry traffic to two peers at the sam
 kill "${pids[@]: -4}" 2>/dev/null || true
 for c in "$S1" "$S2"; do ip netns exec "$A" "$DOWN" "$c" >/dev/null; done
 for c in "$SB1" "$SB2"; do ip netns exec "$B" "$DOWN" "$c" >/dev/null; done
+
+# --- no disguise: plain GRE between the public addresses, no relay -------------------------------
+plain() { # name local remote tun
+  cat >"/etc/golden-gre/$1.conf" <<EOF
+DEV=grp
+LOCAL_PUB=$2
+REMOTE_PUB=$3
+TUN_ADDR=$4
+FACADE=none
+GRE_KEY=81
+EOF
+}
+plain "$P1" 192.0.2.1 192.0.2.2 10.99.71.1/30
+plain "$P2" 192.0.2.2 192.0.2.1 10.99.71.2/30
+ip netns exec "$A" scripts/preflight.sh "$P1" >/dev/null || fail "preflight rejected FACADE=none"
+ip netns exec "$A" "$UP" "$P1" >/dev/null
+ip netns exec "$B" "$UP" "$P2" >/dev/null
+ip -n "$A" -d link show grp | grep -q 'gre remote 192.0.2.2 local 192.0.2.1' \
+  || fail "FACADE=none is not GRE between the public addresses: $(ip -n "$A" -d link show grp)"
+[ -z "$(ip netns exec "$A" ip fou show)" ] || fail "FACADE=none added a FOU listener: $(ip netns exec "$A" ip fou show)"
+ip netns exec "$A" iptables-save | grep -qF -- "-A INPUT -s 192.0.2.2/32 -p gre -m comment --comment \"golden-gre:$P1\" -j ACCEPT" \
+  || fail "FACADE=none has no peer-only GRE INPUT accept"
+# The unit's main process: with no relay to run it must still stay up, or Restart=always rebuilds the tunnel.
+start_relay "$A" "$P1"
+start_relay "$B" "$P2"
+ip netns exec "$A" ping -c 3 -W 2 -q 10.99.71.2 >/dev/null || fail "no ping across a FACADE=none tunnel"
+kill -0 "$RELAY_PID" 2>/dev/null || fail "golden-gre-relay.sh exited with FACADE=none: $(cat "$tmp/relay-$P2.log")"
+ok "no disguise: plain GRE between the public addresses, GRE from the peer only, no FOU listener, no relay"
+kill "${pids[@]: -2}" 2>/dev/null || true
+wait "${pids[@]: -2}" 2>/dev/null || true
+ip netns exec "$A" "$DOWN" "$P1" >/dev/null
+ip netns exec "$B" "$DOWN" "$P2" >/dev/null
+ip -n "$A" link show grp >/dev/null 2>&1 && fail "grp still exists after down"
+ip netns exec "$A" iptables-save | grep -q "golden-gre:$P1" && fail "FACADE=none INPUT rule left behind"
+ok "down removes the plain GRE device and its rule"
 
 # --- dns facade on a path that passes only the first 6 packets of each flow ------------------------
 # connbytes in each host's mangle PREROUTING plays the filter (in INPUT it would sit below the tunnel's

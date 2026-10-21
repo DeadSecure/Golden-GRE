@@ -3,8 +3,9 @@
 #
 # The tunnel is GRE-in-FOU on loopback. golden-gre-relay (started by golden-gre-relay.sh, or by the
 # systemd unit) carries its packets between the two servers inside a DNS-shaped UDP/53 disguise (or
-# ICMP), because a filtered IPv4 path cuts every ordinary tunnel flow after a few packets. This script
-# builds the device and the firewall state; it does not run the relay.
+# ICMP), because a filtered IPv4 path cuts every ordinary tunnel flow after a few packets. FACADE=none
+# skips all that: plain GRE between the public addresses, no relay, for paths that do not cut GRE. This
+# script builds the device and the firewall state; it does not run the relay.
 # Usage: golden-gre-up.sh <instance>
 set -euo pipefail
 
@@ -29,8 +30,8 @@ case "${LOCAL_PUB}${REMOTE_PUB}" in
   *:*) echo "golden-gre: LOCAL_PUB and REMOTE_PUB must be IPv4 addresses ($CONF)" >&2; exit 1 ;;
 esac
 case "${FACADE}" in
-  dns | icmp) ;;
-  *) echo "golden-gre: FACADE must be dns or icmp ($CONF)" >&2; exit 1 ;;
+  dns | icmp | none) ;;
+  *) echo "golden-gre: FACADE must be dns, icmp or none ($CONF)" >&2; exit 1 ;;
 esac
 ICMP_TYPE="${ICMP_TYPE:-0}"
 case "${ICMP_TYPE}" in
@@ -99,7 +100,7 @@ ip route get "${REMOTE_PUB}" >/dev/null 2>&1 \
 # A listener that already exists on a fresh bringup (no device yet) belongs to another tunnel on this
 # host: sharing it would let this tunnel's rollback or teardown remove the other one's listener. A
 # stale one from a crashed run is removed by the unit's ExecStopPost; by hand, run golden-gre-down.sh.
-if ! ip link show "${DEV}" >/dev/null 2>&1 && grep -q "port ${FOU_PORT} " < <(ip fou show 2>/dev/null); then
+if [ "${FACADE}" != none ] && ! ip link show "${DEV}" >/dev/null 2>&1 && grep -q "port ${FOU_PORT} " < <(ip fou show 2>/dev/null); then
   echo "golden-gre: FOU port ${FOU_PORT} is already in use; give each tunnel on this host its own FOU_PORT ($CONF)" >&2
   exit 1
 fi
@@ -121,13 +122,15 @@ if ! ip link show "${DEV}" >/dev/null 2>&1; then
   trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
 fi
 
-# fou has no module alias, so `ip fou add` cannot autoload it. ip_gre does
-# autoload (rtnl-link-gre) at `ip link add type gre`.
-modprobe fou
+if [ "${FACADE}" != none ]; then
+  # fou has no module alias, so `ip fou add` cannot autoload it. ip_gre does
+  # autoload (rtnl-link-gre) at `ip link add type gre`.
+  modprobe fou
 
-# FOU decapsulation listener, loopback only: the relay hands the peer's packets to it (idempotent)
-grep -q "port ${FOU_PORT} " < <(ip fou show 2>/dev/null) \
-  || ip fou add port "${FOU_PORT}" ipproto 47 local 127.0.0.1
+  # FOU decapsulation listener, loopback only: the relay hands the peer's packets to it (idempotent)
+  grep -q "port ${FOU_PORT} " < <(ip fou show 2>/dev/null) \
+    || ip fou add port "${FOU_PORT}" ipproto 47 local 127.0.0.1
+fi
 
 # The relay's wire traffic takes packets from the peer only. Deleted and re-inserted so the rule sits
 # at the top of INPUT and opens the port(s) on hosts whose INPUT policy is DROP (ufw). No DROP rule for
@@ -140,6 +143,8 @@ if [ "${FACADE}" = dns ]; then
   else
     WIRE=(-p udp -m multiport --dports "$(IFS=,; echo "${_ports[*]}")")
   fi
+elif [ "${FACADE}" = none ]; then
+  WIRE=(-p gre)
 else
   WIRE=(-p icmp)
 fi
@@ -163,14 +168,20 @@ fi
 # (re)create the tunnel device (idempotent). Both ends must use the same GRE_KEY; tunnels on one host
 # need different keys, FOU_PORT, RELAY_PORT and LOCAL_PUB.
 ip link del "${DEV}" 2>/dev/null || true
-ip link add "${DEV}" type gre local 127.0.0.1 remote 127.0.0.1 ttl 255 key "${GRE_KEY}" \
-  encap fou encap-sport "${FOU_PORT}" encap-dport "${RELAY_PORT}"
+if [ "${FACADE}" = none ]; then
+  ip link add "${DEV}" type gre local "${LOCAL_PUB}" remote "${REMOTE_PUB}" ttl 255 key "${GRE_KEY}"
+else
+  ip link add "${DEV}" type gre local 127.0.0.1 remote 127.0.0.1 ttl 255 key "${GRE_KEY}" \
+    encap fou encap-sport "${FOU_PORT}" encap-dport "${RELAY_PORT}"
+fi
 ip addr add "${TUN_ADDR}" dev "${DEV}"
 ip link set "${DEV}" mtu "${MTU}" up
 
 # One packet per datagram. With GSO the kernel would hand the relay datagrams of up to 64 KB, and the
-# loopback path does not segment them.
-ethtool -K "${DEV}" tso off gso off gro off >/dev/null 2>&1 || true
+# loopback path does not segment them. Plain GRE has no relay and keeps GSO.
+if [ "${FACADE}" != none ]; then
+  ethtool -K "${DEV}" tso off gso off gro off >/dev/null 2>&1 || true
+fi
 
 # Accept forwarded traffic in/out of the tunnel. Deleted and re-inserted so it is
 # always at the top, ahead of any DROP that Docker/ufw added since the last run.
@@ -223,4 +234,8 @@ if [ "${#FWD_PORTS[@]}" -gt 0 ]; then
     -m comment --comment "golden-gre-fwd:${NAME}" -j MASQUERADE
 fi
 
-echo "golden-gre: ${DEV} up — ${TUN_ADDR} -> ${REMOTE_PUB} (relay ${FACADE}, mtu ${MTU}); run the relay: golden-gre-relay.sh ${NAME}"
+if [ "${FACADE}" = none ]; then
+  echo "golden-gre: ${DEV} up — ${TUN_ADDR} -> ${REMOTE_PUB} (plain GRE, no disguise, mtu ${MTU})"
+else
+  echo "golden-gre: ${DEV} up — ${TUN_ADDR} -> ${REMOTE_PUB} (relay ${FACADE}, mtu ${MTU}); run the relay: golden-gre-relay.sh ${NAME}"
+fi

@@ -139,6 +139,19 @@ fi
 grep -q 'already has a DNS tunnel on 192.0.2.1 (tunnel 192.0.2.8)' "$tmp/a4.out" || { cat "$tmp/a4.out"; fail "dns refusal does not say why"; }
 ok "several icmp tunnels share a public address with at most one dns tunnel; the first keeps working"
 
+# Disguise 4: none, plain GRE. The peer is not set up, so setup prints what its firewall must let in.
+printf '192.0.2.1\n192.0.2.5\n4\n' | run_setup "$A" >"$tmp/a5.out" 2>&1 || { cat "$tmp/a5.out"; fail "a tunnel with no disguise was refused"; }
+c5="/etc/netns/$A/golden-gre/192.0.2.5.conf"
+grep -qx 'FACADE=none' "$c5" || fail "disguise 4 did not write FACADE=none: $(cat "$c5")"
+grep -q 'disguise none' "$tmp/a5.out" || { cat "$tmp/a5.out"; fail "the pair check does not name the disguise none"; }
+grep -q 'GRE (IP protocol 47)' "$tmp/a5.out" || { cat "$tmp/a5.out"; fail "no-disguise setup does not say the firewall must let GRE in"; }
+# shellcheck disable=SC2016 # expands in the inner shell
+if ip netns exec "$A" bash -c '. ./golden-gre.sh; systemctl() { return 1; }; toggle_fec 192.0.2.5' >"$tmp/fec.out" 2>&1; then
+  fail "FEC was turned on for a tunnel with no relay"
+fi
+if grep -q '^FEC=' "$c5"; then fail "a refused FEC toggle still wrote FEC"; fi
+ok "setup writes no disguise as FACADE=none; FEC, which needs the relay, is refused"
+
 # A port forwarded by one tunnel on an address cannot be forwarded by another tunnel on it.
 echo 'FORWARD="443"' >>"$c9"
 # shellcheck disable=SC2016 # expands in the inner shell
@@ -191,6 +204,12 @@ systemctl is-active -q "$U" || fail "$U is not running after the disguise switch
 printf '%s\n' 2 1 7 3 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
 if ! grep -qx 'FACADE=icmp' "$CONF" || grep -q '^ICMP_TYPE=8' "$CONF"; then cat "$tmp/menu.out"; fail "switch to ICMP replies left ICMP_TYPE=8"; fi
 [ -z "$(echo_drop)" ] || fail "ICMP replies left the echo-reply drop behind: $(echo_drop)"
+# -> 4 (none): plain GRE, and the unit stays up with no relay to run
+printf '%s\n' 2 1 7 4 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
+grep -qx 'FACADE=none' "$CONF" || { cat "$tmp/menu.out"; fail "switch to no disguise did not write FACADE=none"; }
+sleep 2
+systemctl is-active -q "$U" || { journalctl -u "$U" -n 20 --no-pager; fail "$U is not running with no disguise"; }
+[[ $(rules) == *"-p gre"* && $(rules) != *"-p icmp"* ]] || fail "wrong accept rules after switching to no disguise: $(rules)"
 # -> 2 (DNS)
 printf '%s\n' 2 1 7 2 0 '' 0 | "$SELF" >"$tmp/menu.out" 2>&1 || { cat "$tmp/menu.out"; fail "menu failed"; }
 grep -qx 'FACADE=dns' "$CONF" || fail "switching back did not write FACADE=dns"

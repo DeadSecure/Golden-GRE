@@ -12,6 +12,10 @@ CONF="/etc/golden-gre/${NAME}.conf"
 : "${LOCAL_PUB:?LOCAL_PUB not set in $CONF}"
 : "${REMOTE_PUB:?REMOTE_PUB not set in $CONF}"
 
+# FACADE=none: plain GRE between the public addresses, nothing to relay. Stay in the foreground anyway:
+# this is the unit's main process, and Restart=always would rebuild the tunnel every time it exits.
+[ "${FACADE:-dns}" != none ] || exec sleep infinity
+
 RELAY="${GOLDEN_GRE_RELAY:-/usr/local/sbin/golden-gre-relay}"
 [ -x "$RELAY" ] || { echo "golden-gre: relay binary $RELAY not found (run install.sh)" >&2; exit 1; }
 
