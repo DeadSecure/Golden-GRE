@@ -333,10 +333,59 @@ static void wire_emit(const uint8_t *a, size_t alen, const uint8_t *b, size_t bl
   if (++nw == OUTQ || (rotate && sockframes + (unsigned long)nw >= (unsigned long)rotate)) wire_flush();
 }
 
+// Deliver decrypted packets to the local tunnel endpoint. Like wire_flush, coalesce a run of equal-size
+// packets into one UDP GSO send (they all go to the one reply address), so the kernel builds and
+// segments a single skb instead of running udp_sendmsg per packet — the relay's top cost under load.
+static int local_gso = 1;  // loopback UDP GSO; turned off for good if the kernel ever refuses it
 static void local_flush(void) {
+  static struct mmsghdr g[OUTQ];
+  static union { char buf[CMSG_SPACE(sizeof(uint16_t))]; struct cmsghdr align; } cm[OUTQ];
+  static int first[OUTQ], nseg[OUTQ];
   if (!nl) return;
-  int sent = sendmmsg(loc, lmsg, nl, 0);
-  if (sent > 0) ADD(nrx, sent);
+  if (!local_gso) {
+    int sent = sendmmsg(loc, lmsg, nl, 0);
+    if (sent > 0) ADD(nrx, sent);
+    nl = 0;
+    return;
+  }
+  int ng = 0;
+  for (int i = 0; i < nl;) {
+    size_t sz = liov[i].iov_len;
+    int n = 1, cap = sz <= GSO_FRAME ? (int)(GSO_BYTES / sz) : 1;
+    if (cap > GSO_MAX) cap = GSO_MAX;
+    while (i + n < nl && n < cap && liov[i + n].iov_len <= sz)
+      if (liov[i + n++].iov_len < sz) break;  // a shorter packet may only end a run
+    g[ng].msg_hdr = (struct msghdr){.msg_name = &reply, .msg_namelen = sizeof reply, .msg_iov = &liov[i], .msg_iovlen = n};
+    if (n > 1) {
+      uint16_t s16 = sz;
+      g[ng].msg_hdr.msg_control = cm[ng].buf;
+      g[ng].msg_hdr.msg_controllen = sizeof cm[ng].buf;
+      struct cmsghdr *c = CMSG_FIRSTHDR(&g[ng].msg_hdr);
+      c->cmsg_level = SOL_UDP;
+      c->cmsg_type = UDP_SEGMENT;
+      c->cmsg_len = CMSG_LEN(sizeof s16);
+      memcpy(CMSG_DATA(c), &s16, sizeof s16);
+    }
+    first[ng] = i;
+    nseg[ng++] = n;
+    i += n;
+  }
+  for (int j = 0; j < ng;) {
+    int sent = sendmmsg(loc, g + j, ng - j, 0);
+    if (sent > 0) {
+      for (int k = j; k < j + sent; k++) ADD(nrx, nseg[k]);
+      j += sent;
+      continue;
+    }
+    if (nseg[j] > 1 && (errno == EIO || errno == EINVAL)) {  // no UDP GSO to the tunnel here: plain sends from now on
+      printf("local udp gso unavailable (%s); sending packets one by one\n", strerror(errno));
+      fflush(stdout);
+      local_gso = 0;
+      int rest = sendmmsg(loc, lmsg + first[j], nl - first[j], 0);
+      if (rest > 0) ADD(nrx, rest);
+    }
+    break;  // a full socket buffer: drop the rest, as a plain send would
+  }
   nl = 0;
 }
 
