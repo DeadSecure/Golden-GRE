@@ -238,7 +238,8 @@ setup_tunnel() {
   relay=$(next_port 5601 ${taken[@]+"${taken[@]}"} "$fou")
   install -d -m 0750 "$CONF_DIR"
   local enc_line=''
-  if [ "$facade" != none ] && yes_no "Encrypt the payload (XChaCha20-Poly1305, recommended)? [Y/n] " y; then
+  # Only offer encryption interactively: deriving the key needs a passphrase typed on a terminal.
+  if [ "$facade" != none ] && [ -t 0 ] && yes_no "Encrypt the payload (XChaCha20-Poly1305, recommended)? [Y/n] " y; then
     derive_key_file "$name" "$s1" "$s2" || return 1
     enc_line="KEYFILE=$CONF_DIR/$name.key"
   fi
