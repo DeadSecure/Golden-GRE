@@ -727,7 +727,12 @@ static void *wire_to_local(void *arg) {  // peer -> facade -> FEC -> tunnel
         if (keyed) {  // nonce || ciphertext || tag; a verifying tag is what marks the frame as ours
           if (len < NONCE + TAG) { ADD(nbad, 1); continue; }
           size_t ctlen = len - NONCE - TAG;
-          if (crypto_aead_unlock(pt, p + NONCE + ctlen, key, p, NULL, 0, p + NONCE, ctlen)) { ADD(nbad, 1); continue; }
+          if (crypto_aead_unlock(pt, p + NONCE + ctlen, key, p, NULL, 0, p + NONCE, ctlen)) {
+            static int warned;  // a key mismatch drops every frame: say why once instead of going quiet
+            if (!warned++) fprintf(stderr, "golden-gre-relay: payload decrypt failed: both ends must use the same KEYFILE\n");
+            ADD(nbad, 1);
+            continue;
+          }
           p = pt;
           len = ctlen;
         }
@@ -846,6 +851,7 @@ int main(int argc, char **argv) {
       die("AEAD self-test failed");
     randomize_question();
     cur_ident = (unsigned)(xrng() & 0xFFFF);
+    if (cur_ident == IDENT) cur_ident ^= 1;  // never emit the legacy constant id by chance
   }
   // a random first block number, so the peer cannot mistake a restarted sender's blocks for old ones
   if (getrandom(&enc.id, sizeof enc.id, 0) != sizeof enc.id) enc.id = (uint32_t)now_ms();

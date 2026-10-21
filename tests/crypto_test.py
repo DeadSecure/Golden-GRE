@@ -177,6 +177,8 @@ def run_case(binary, facade, case):
     elif case == "wrongkey":
         if got:
             fail("B with the wrong key delivered %d packets (want 0)" % len(got))
+        if "decrypt failed" not in logs:
+            fail("B dropped every frame but never said the keys differ")
     elif case == "encrypted":
         if not wire:
             fail("captured no wire datagrams")
