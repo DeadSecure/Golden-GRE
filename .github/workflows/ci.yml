@@ -50,6 +50,8 @@ jobs:
         run: sudo tests/relay.sh
       - name: two namespaces, real tunnels — up, data, second tunnel, failure paths, down
         run: sudo tests/e2e.sh
+      - name: manager encryption helpers (key derivation, toggle)
+        run: sudo tests/manager_enc.sh
       - name: systemd wiring — relay is the main process, check timer follows the tunnel
         run: sudo tests/systemd.sh
       - name: easy manager — both ends agree, setup builds a tunnel, then the menu under systemd (uninstalls, so last)

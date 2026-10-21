@@ -745,7 +745,46 @@ static void print_counters(void) {
   fflush(stdout);
 }
 
+// --derive-key "<a>,<b>": read a passphrase from stdin and write a 32-byte key to stdout. The salt is
+// BLAKE2b of the two comma-separated tokens sorted, so both ends derive the same key from the same
+// passphrase and the same IP pair in either order, with nothing transferred between them.
+static int derive_key(const char *salt_arg) {
+  char buf[256];
+  snprintf(buf, sizeof buf, "%s", salt_arg);
+  char *comma = strchr(buf, ','), salt_str[600];
+  if (comma) {  // sort the two tokens so "a,b" and "b,a" hash the same
+    *comma = 0;
+    const char *x = buf, *y = comma + 1;
+    if (strcmp(x, y) > 0) { const char *t = x; x = y; y = t; }
+    snprintf(salt_str, sizeof salt_str, "%s,%s", x, y);
+  } else {
+    snprintf(salt_str, sizeof salt_str, "%s", salt_arg);
+  }
+  uint8_t pass[1024];
+  size_t plen = 0;
+  ssize_t r;
+  while (plen < sizeof pass && (r = read(0, pass + plen, sizeof pass - plen)) > 0) plen += r;
+  while (plen && (pass[plen - 1] == '\n' || pass[plen - 1] == '\r')) plen--;  // drop a trailing newline
+  if (!plen) { fprintf(stderr, "golden-gre-relay: empty passphrase on stdin\n"); return 1; }
+  uint8_t salt[16];
+  crypto_blake2b(salt, sizeof salt, (const uint8_t *)salt_str, strlen(salt_str));
+  uint32_t blocks = 65536;  // 64 MiB, 3 passes: one-time at setup, cheap to verify, costly to brute-force
+  void *work = malloc((size_t)blocks * 1024);
+  if (!work) die("malloc");
+  uint8_t out[32];
+  crypto_argon2(out, sizeof out, work,
+                (crypto_argon2_config){CRYPTO_ARGON2_I, blocks, 3, 1},
+                (crypto_argon2_inputs){pass, salt, (uint32_t)plen, sizeof salt},
+                crypto_argon2_no_extras);
+  crypto_wipe(pass, sizeof pass);
+  free(work);
+  if (write(1, out, sizeof out) != (ssize_t)sizeof out) { crypto_wipe(out, sizeof out); return 1; }
+  crypto_wipe(out, sizeof out);
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc == 3 && !strcmp(argv[1], "--derive-key")) return derive_key(argv[2]);
   const char *facade = NULL, *bind_ip = NULL, *peer_ip = NULL, *local = NULL, *reply_arg = NULL, *fec_arg = NULL;
   const char *gso_arg = "on", *rotate_arg = NULL, *port_arg = "53", *rate_arg = NULL, *keyfile = NULL;
   for (int i = 1; i + 1 < argc; i += 2) {

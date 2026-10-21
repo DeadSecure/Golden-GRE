@@ -123,7 +123,7 @@ One file per tunnel, `/etc/golden-gre/<name>.conf`:
 | `MTU` | `1380` | If the path carries 1500-byte packets (`ping -M do -s 1472 <peer>` answers), use `1464` for icmp, `1425` for dns or `1472` for none. |
 | `GRE_KEY` | `41` | Same on both ends; different per tunnel on a host. |
 | `FEC` | off | `K:M`: M parity packets per K on what this end sends. |
-| `KEYFILE` | off | Path to a 32-byte pre-shared key. The **same** key on both ends encrypts the payload with XChaCha20-Poly1305 and replaces the fixed `dns`/`icmp` markers with random ones, so the wire carries no constant signature. Make one with `head -c32 /dev/urandom > KEYFILE && chmod 600 KEYFILE` and copy it to the peer. Unset = plaintext with fixed markers. |
+| `KEYFILE` | off | Path to a 32-byte pre-shared key. The **same** key on both ends encrypts the payload with XChaCha20-Poly1305 and replaces the fixed `dns`/`icmp` markers with random ones, so the wire carries no constant signature. `golden-gre` setup offers this and derives the key from a passphrase you type on both servers (no key copied between them); or make one by hand with `head -c32 /dev/urandom > KEYFILE && chmod 600 KEYFILE` and copy it to the peer. Unset = plaintext with fixed markers. |
 | `FORWARD` | none | Ports to forward to the peer, comma- or space-separated: `"443,1080,2053:2096,8080=80"`. |
 | `ROUTES` | none | CIDRs to route via the tunnel. |
 | `NAT_SRC` / `NAT_OUT` | none | MASQUERADE this source out an interface (use the node as an exit). |

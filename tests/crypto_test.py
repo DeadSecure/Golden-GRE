@@ -198,7 +198,35 @@ def run_case(binary, facade, case):
     sys.exit(0)
 
 
+def derive(binary, salt, passphrase):
+    p = subprocess.run([binary, "--derive-key", salt], input=passphrase.encode(),
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return p.stdout
+
+
+def run_kdf(binary):
+    def fail(msg):
+        print("FAIL [kdf]: %s" % msg)
+        sys.exit(1)
+    salt = "203.0.113.1,198.51.100.2"
+    k1 = derive(binary, salt, "correct horse battery staple")
+    if len(k1) != 32:
+        fail("key is %d bytes, want 32" % len(k1))
+    if derive(binary, salt, "correct horse battery staple") != k1:
+        fail("same passphrase + salt gave a different key (not deterministic)")
+    if derive(binary, "198.51.100.2,203.0.113.1", "correct horse battery staple") != k1:
+        fail("swapped IP pair gave a different key (salt not order-independent)")
+    if derive(binary, salt, "wrong passphrase") == k1:
+        fail("a different passphrase gave the same key")
+    if derive(binary, "203.0.113.9,198.51.100.2", "correct horse battery staple") == k1:
+        fail("a different IP pair gave the same key")
+    print("PASS [kdf]")
+    sys.exit(0)
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[2] == "kdf":
+        run_kdf(sys.argv[1])
     if len(sys.argv) != 4:
         sys.exit(__doc__)
     run_case(sys.argv[1], sys.argv[2], sys.argv[3])

@@ -174,7 +174,7 @@ remove_tunnel() { # name — stop first: the unit's teardown reads the config
   systemctl disable --now "golden-gre-check@$1.timer" >/dev/null 2>&1
   systemctl disable --now "golden-gre@$1" >/dev/null 2>&1
   systemctl reset-failed "golden-gre@$1" "golden-gre-check@$1.service" >/dev/null 2>&1
-  rm -f "$CONF_DIR/$1.conf"
+  rm -f "$CONF_DIR/$1.conf" "$CONF_DIR/$1.key"
 }
 
 setup_tunnel() {
@@ -237,6 +237,11 @@ setup_tunnel() {
   fou=$(next_port 5599 ${taken[@]+"${taken[@]}"})
   relay=$(next_port 5601 ${taken[@]+"${taken[@]}"} "$fou")
   install -d -m 0750 "$CONF_DIR"
+  local enc_line=''
+  if [ "$facade" != none ] && yes_no "Encrypt the payload (XChaCha20-Poly1305, recommended)? [Y/n] " y; then
+    derive_key_file "$name" "$s1" "$s2" || return 1
+    enc_line="KEYFILE=$CONF_DIR/$name.key"
+  fi
   {
     echo "# Made by golden-gre setup. $peer has the matching file: same GRE_KEY, the other address of the /30."
     echo "DEV=$dev"
@@ -247,6 +252,7 @@ setup_tunnel() {
     echo "FOU_PORT=$fou"
     echo "RELAY_PORT=$relay"
     disguise_lines "$facade"
+    [ -n "$enc_line" ] && echo "$enc_line"
   } >"$conf"
   good "Saved $conf"
 
@@ -311,6 +317,45 @@ interruptible() { # command... — Ctrl+C stops the command, not this menu
 follow_logs() { # name
   say "${D}Live logs. Press Ctrl+C to go back.${N}"
   interruptible journalctl -u "golden-gre@$1" -n 20 -f
+}
+ask_secret() { # prompt varname -> sets the named variable, input not echoed
+  local _s
+  read -r -s -p "$1" _s || { echo; exit 0; }
+  echo
+  printf -v "$2" '%s' "$_s"
+}
+enc_status() { [ -n "$(conf_get "$1" KEYFILE)" ] && echo on || echo off; }
+# Derive the 32-byte key from a passphrase and the IP pair into CONF_DIR/<name>.key. Both servers that
+# type the same passphrase for the same pair get the same key, so nothing secret is transferred.
+derive_key_file() { # name ip1 ip2
+  local name=$1 s1=$2 s2=$3 kf="$CONF_DIR/$1.key" pass pass2 relay="${GOLDEN_GRE_RELAY:-/usr/local/sbin/golden-gre-relay}"
+  [ -x "$relay" ] || { bad "relay binary $relay not found — run the installer first."; return 1; }
+  while :; do
+    ask_secret "Encryption passphrase (type the SAME one on both servers): " pass
+    [ -n "$pass" ] || { bad "Empty passphrase."; continue; }
+    ask_secret "Repeat passphrase: " pass2
+    [ "$pass" = "$pass2" ] && break
+    bad "The passphrases do not match. Try again."
+  done
+  ( umask 077; printf '%s' "$pass" | "$relay" --derive-key "$s1,$s2" >"$kf" )
+  if [ "$(wc -c <"$kf" 2>/dev/null)" != 32 ]; then bad "Key derivation failed."; rm -f "$kf"; return 1; fi
+  chmod 600 "$kf"
+  good "Key saved to $kf. Use the same passphrase on the other server."
+}
+toggle_enc() { # name
+  local n=$1 conf="$CONF_DIR/$1.conf" kf="$CONF_DIR/$1.key"
+  if [ -n "$(conf_get "$n" KEYFILE)" ]; then
+    sed -i '/^KEYFILE=/d' "$conf"; rm -f "$kf"
+    good "Encryption off"
+  elif [ "$(conf_get "$n" FACADE dns)" = none ]; then
+    bad "Disguise 'none' is plain GRE with no relay, so there is nothing to encrypt. Pick a disguise first."
+    return 1
+  else
+    derive_key_file "$n" "$(conf_get "$n" LOCAL_PUB)" "$(conf_get "$n" REMOTE_PUB)" || return 1
+    echo "KEYFILE=$kf" >>"$conf"
+    good "Encryption on. Set the SAME passphrase on the peer and restart both ends."
+  fi
+  if systemctl is-active -q "golden-gre@$n"; then systemctl restart "golden-gre@$n" && good "Restarted"; fi
 }
 toggle_fec() { # name
   local conf="$CONF_DIR/$1.conf"
@@ -478,12 +523,12 @@ forward_menu() { # name
 }
 
 tunnel_menu() { # name
-  local n=$1 peer disguise fec
+  local n=$1 peer disguise fec enc
   while :; do
     peer=$(conf_get "$n" PEER_ADDR "$(peer_of "$(conf_get "$n" TUN_ADDR)")")
-    disguise=$(disguise_of "$n") fec=$(conf_get "$n" FEC off)
+    disguise=$(disguise_of "$n") fec=$(conf_get "$n" FEC off) enc=$(enc_status "$n")
     say ""
-    say "${Y}Tunnel $n${N}: $(systemctl is-active "golden-gre@$n" 2>/dev/null), disguise $disguise, FEC $fec"
+    say "${Y}Tunnel $n${N}: $(systemctl is-active "golden-gre@$n" 2>/dev/null), disguise $disguise, FEC $fec, encryption $enc"
     say "   1) Start"
     say "   2) Stop"
     say "   3) Restart"
@@ -492,9 +537,10 @@ tunnel_menu() { # name
     say "   6) Live logs"
     say "   7) Disguise: $disguise (change)"
     say "   8) FEC: $fec (turn $([ "$fec" = off ] && echo on || echo off))"
-    say "   9) Port forwarding: $(conf_get "$n" FORWARD none)"
-    say "  10) Show settings"
-    say "  11) Delete"
+    say "   9) Encryption: $enc (turn $([ "$enc" = off ] && echo on || echo off))"
+    say "  10) Port forwarding: $(conf_get "$n" FORWARD none)"
+    say "  11) Show settings"
+    say "  12) Delete"
     say "   0) Back"
     ask "> "
     case $REPLY in
@@ -507,9 +553,10 @@ tunnel_menu() { # name
       6) follow_logs "$n" ;;
       7) pick_disguise; set_disguise "$n" "$DISGUISE" ;;
       8) toggle_fec "$n" ;;
-      9) forward_menu "$n" ;;
-      10) cat "$CONF_DIR/$n.conf" ;;
-      11) if yes_no "Delete tunnel $n? It stops now and its settings are removed. [y/N] " n; then
+      9) toggle_enc "$n" ;;
+      10) forward_menu "$n" ;;
+      11) cat "$CONF_DIR/$n.conf" ;;
+      12) if yes_no "Delete tunnel $n? It stops now and its settings are removed. [y/N] " n; then
            remove_tunnel "$n"
            good "Deleted"
            return

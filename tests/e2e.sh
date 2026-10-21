@@ -544,6 +544,7 @@ grep -q 'IPv4' <<<"$out" || fail "IPv6 endpoints are not explained: $out"
 ok "IPv6 endpoints are rejected with an explanation"
 
 # --- payload encryption (--keyfile): two relays over loopback, every behaviour ---
+out="$(python3 tests/crypto_test.py "$tmp/relay" kdf 2>&1)" || fail "crypto kdf: $out"
 for facade in dns icmp; do
   for case in deliver encrypted markers wrongkey legacy; do
     [ "$facade" = icmp ] && [ "$case" = encrypted ] && continue  # icmp capture is covered by markers
