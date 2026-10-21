@@ -9,12 +9,14 @@ tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # test never depends on or overwrites an installed binary.
 gcc -O2 -Wall -pthread -o "$tmp/relay" relay/golden-gre-relay.c relay/monocypher.c
 export GOLDEN_GRE_RELAY="$tmp/relay"
-export CONF_DIR="$tmp/conf"; mkdir -p "$CONF_DIR"
 fail(){ echo "FAIL: $*" >&2; exit 1; }
 
 # Source only the functions (golden-gre.sh runs main only when executed directly, not when sourced).
 # shellcheck source=/dev/null
 source ./golden-gre.sh
+# golden-gre.sh sets CONF_DIR=/etc/golden-gre on source; override it AFTER to a throwaway dir so the
+# functions (which read CONF_DIR at call time) never touch the real /etc/golden-gre.
+CONF_DIR="$tmp/conf"; mkdir -p "$CONF_DIR"
 
 # a conf like setup writes, icmp disguise, no key yet
 cat >"$CONF_DIR/peerA.conf" <<EOF
