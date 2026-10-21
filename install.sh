@@ -8,7 +8,7 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 command -v gcc >/dev/null 2>&1 || { echo "golden-gre: gcc is needed to build the relay (apt install gcc)" >&2; exit 1; }
 
 echo "==> building the relay"
-gcc -O2 -Wall -pthread -o /usr/local/sbin/golden-gre-relay "$SRC/relay/golden-gre-relay.c"
+gcc -O2 -Wall -pthread -o /usr/local/sbin/golden-gre-relay "$SRC/relay/golden-gre-relay.c" "$SRC/relay/monocypher.c"
 
 echo "==> installing scripts to /usr/local/sbin"
 install -m 0755 "$SRC/scripts/golden-gre-up.sh"    /usr/local/sbin/golden-gre-up.sh

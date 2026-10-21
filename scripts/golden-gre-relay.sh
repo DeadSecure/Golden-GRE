@@ -26,7 +26,10 @@ RELAY="${GOLDEN_GRE_RELAY:-/usr/local/sbin/golden-gre-relay}"
 # The icmp facade shares one raw socket for both directions and has no source port: rotation is off there.
 # RATE (dns only): cap on frames per second the relay puts on the wire; keeps sustained churn under
 # what the path accepts instead of getting clamped. Unset = no cap.
+# KEYFILE: path to a 32-byte pre-shared key. Set (to the same key) on both ends to encrypt the payload
+# with XChaCha20-Poly1305 and randomize the facade markers; unset = plaintext, fixed markers (legacy).
 [ "${FACADE:-dns}" = dns ] || SPORT_ROTATE=
 exec "$RELAY" --facade "${FACADE:-dns}" --bind "${LOCAL_PUB}" --peer "${REMOTE_PUB}" \
   --local "127.0.0.1:${RELAY_PORT:-5601}" --reply "127.0.0.1:${FOU_PORT:-5599}" --port "${DNS_PORTS:-${DNS_PORT:-53}}" \
-  --itype "${ICMP_TYPE:-0}" ${FEC:+--fec "$FEC"} ${SPORT_ROTATE:+--rotate "$SPORT_ROTATE"} ${RATE:+--rate "$RATE"}
+  --itype "${ICMP_TYPE:-0}" ${FEC:+--fec "$FEC"} ${SPORT_ROTATE:+--rotate "$SPORT_ROTATE"} ${RATE:+--rate "$RATE"} \
+  ${KEYFILE:+--keyfile "$KEYFILE"}

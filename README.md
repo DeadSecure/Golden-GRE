@@ -123,6 +123,7 @@ One file per tunnel, `/etc/golden-gre/<name>.conf`:
 | `MTU` | `1380` | If the path carries 1500-byte packets (`ping -M do -s 1472 <peer>` answers), use `1464` for icmp, `1425` for dns or `1472` for none. |
 | `GRE_KEY` | `41` | Same on both ends; different per tunnel on a host. |
 | `FEC` | off | `K:M`: M parity packets per K on what this end sends. |
+| `KEYFILE` | off | Path to a 32-byte pre-shared key. The **same** key on both ends encrypts the payload with XChaCha20-Poly1305 and replaces the fixed `dns`/`icmp` markers with random ones, so the wire carries no constant signature. Make one with `head -c32 /dev/urandom > KEYFILE && chmod 600 KEYFILE` and copy it to the peer. Unset = plaintext with fixed markers. |
 | `FORWARD` | none | Ports to forward to the peer, comma- or space-separated: `"443,1080,2053:2096,8080=80"`. |
 | `ROUTES` | none | CIDRs to route via the tunnel. |
 | `NAT_SRC` / `NAT_OUT` | none | MASQUERADE this source out an interface (use the node as an exit). |
@@ -199,7 +200,7 @@ Logs: `journalctl -u golden-gre@<name>`.
 
 ## 🔐 Security
 
-- **Unencrypted**, like GRE. For confidentiality run WireGuard through the relay ([docs/WireGuard.md](docs/WireGuard.md)) or carry already-encrypted traffic (TLS, VLESS+Reality).
+- **Unencrypted by default**, like GRE. For confidentiality set `KEYFILE` (XChaCha20-Poly1305 over the payload, same key both ends), run WireGuard through the relay ([docs/WireGuard.md](docs/WireGuard.md)), or carry already-encrypted traffic (TLS, VLESS+Reality). With `KEYFILE` the facade markers are also randomized, so no constant byte pattern identifies the tunnel. No anti-replay window: the tag stops forgery, but a captured frame can be replayed (a duplicate the inner transport already tolerates).
 - The relay accepts frames only from `REMOTE_PUB` with the right shape and never replies to anything else. A spoofer who forges both can still inject; the GRE key (sent in cleartext) stops blind injection.
 - Everything routed through `greN` is forwarded. Filter inside the overlay if the peer shouldn't reach everything this host can.
 - Keep real addresses out of git: configs live in `/etc/golden-gre/`.

@@ -29,7 +29,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-gcc -O2 -Wall -pthread -o "$tmp/relay" relay/golden-gre-relay.c
+gcc -O2 -Wall -pthread -o "$tmp/relay" relay/golden-gre-relay.c relay/monocypher.c
 export GOLDEN_GRE_RELAY="$tmp/relay"
 
 start_relay() { # namespace instance -> background relay, pid in $RELAY_PID
@@ -542,5 +542,14 @@ EOF
 out="$(ip netns exec "$A" "$UP" "$CX" 2>&1)" && fail "up accepted IPv6 endpoints"
 grep -q 'IPv4' <<<"$out" || fail "IPv6 endpoints are not explained: $out"
 ok "IPv6 endpoints are rejected with an explanation"
+
+# --- payload encryption (--keyfile): two relays over loopback, every behaviour ---
+for facade in dns icmp; do
+  for case in deliver encrypted markers wrongkey legacy; do
+    [ "$facade" = icmp ] && [ "$case" = encrypted ] && continue  # icmp capture is covered by markers
+    out="$(python3 tests/crypto_test.py "$tmp/relay" "$facade" "$case" 2>&1)" || fail "crypto $facade/$case: $out"
+  done
+done
+ok "payload encryption: deliver, encrypted, random markers, wrong-key drop and legacy pass for dns and icmp"
 
 echo "e2e: PASS"

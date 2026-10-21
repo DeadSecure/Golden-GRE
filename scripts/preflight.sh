@@ -61,6 +61,11 @@ if [ -n "$NAME" ]; then
       none) w "verify the path end-to-end with: tcpdump -ni any proto gre  (run on the peer while this side sends)" ;;
       *) b "FACADE must be dns, icmp or none" ;;
     esac
+    if [ -n "${KEYFILE:-}" ]; then
+      if [ ! -r "$KEYFILE" ]; then b "KEYFILE $KEYFILE is not readable (needs the same 32-byte key as the peer)"
+      elif [ "$(wc -c <"$KEYFILE")" -ne 32 ]; then b "KEYFILE $KEYFILE must be exactly 32 bytes"
+      else g "KEYFILE present (payload encryption on); the peer must hold the same key"; fi
+    fi
   else
     b "config not found — create it from examples/"
   fi
