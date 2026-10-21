@@ -60,7 +60,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-gcc -O2 -Wall -pthread -o "$tmp/relay" relay/golden-gre-relay.c
+gcc -O2 -Wall -pthread -o "$tmp/relay" relay/golden-gre-relay.c relay/monocypher.c
 export GOLDEN_GRE_RELAY="$tmp/relay" PATH="$PWD/scripts:$PATH"
 
 ip netns add "$A"

@@ -27,7 +27,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-gcc -O2 -Wall -Wextra -Werror -pthread -o "$tmp/relay" relay/golden-gre-relay.c
+gcc -O2 -Wall -Wextra -Werror -pthread -o "$tmp/relay" relay/golden-gre-relay.c relay/monocypher.c
 ok "relay builds without warnings"
 
 run_facade() {

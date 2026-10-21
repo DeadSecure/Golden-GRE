@@ -19,7 +19,7 @@ jobs:
       - name: Python compiles
         run: python3 -m py_compile bench/remote/*.py
       - name: relay builds without warnings
-        run: gcc -O2 -Wall -Wextra -Werror -pthread -o /tmp/golden-gre-relay relay/golden-gre-relay.c
+        run: gcc -O2 -Wall -Wextra -Werror -pthread -o /tmp/golden-gre-relay relay/golden-gre-relay.c relay/monocypher.c
       - name: scripts are executable & have bash shebang
         run: |
           for s in golden-gre.sh scripts/*.sh tests/*.sh install.sh; do
