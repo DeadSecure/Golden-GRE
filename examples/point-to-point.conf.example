@@ -15,6 +15,7 @@ TUN_ADDR=10.99.99.1/30      # this end's overlay IP (peer = 10.99.99.2/30)
 # ICMP_TYPE=0                      # icmp facade: 8 = echo requests, 0 = echo replies (same on both ends)
 # DNS_PORT=53                      # dns facade: UDP port on both ends
 # MTU=1380                         # tunnel MTU
+# KEYFILE=/etc/golden-gre/<name>.key  # 32-byte pre-shared key; same file on both ends encrypts the payload (XChaCha20-Poly1305) and randomizes the dns/icmp markers. Make one with: head -c32 /dev/urandom > KEYFILE && chmod 600 KEYFILE
 # FEC=10:5                         # parity on what this end sends: M per K packets (set on the side sending into loss)
 # GRE_KEY=41                     # same on both ends; several tunnels on one host need different keys
 # RELAY_PORT=5601                  # loopback UDP port between the tunnel and the relay (unique per tunnel)

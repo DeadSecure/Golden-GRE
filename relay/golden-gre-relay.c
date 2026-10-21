@@ -26,6 +26,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/filter.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -39,6 +40,8 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "monocypher.h"
 
 #define BATCH 64
 #define OUTQ 128
@@ -54,10 +57,13 @@
 #define MMAX 32
 #define NSLOT 64        // blocks the receiver keeps open
 #define FLUSH_MS 5
-#define MAXPAY (BUF - HEAD - FEC_HDR - 2)  // largest tunnel packet; parity carries a 2-byte length too
+#define MAXPAY (BUF - HEAD - FEC_HDR - 2 - CRYPTO_OH)  // largest tunnel packet; room for FEC len + AEAD nonce/tag
 #define GSO_MAX 32       // frames per UDP GSO send (the kernel allows 64 on older versions)
 #define GSO_BYTES 60000  // and bytes per send (one UDP datagram before segmentation)
 #define GSO_FRAME 1472   // frames above this would not fit a 1500-byte MTU unfragmented: sent alone
+#define NONCE 24         // XChaCha20-Poly1305 nonce, prepended to the frame payload when keyed
+#define TAG 16           // Poly1305 authentication tag, appended after the ciphertext when keyed
+#define CRYPTO_OH (NONCE + TAG)
 
 #ifndef UDP_SEGMENT
 #define UDP_SEGMENT 103
@@ -67,6 +73,46 @@
 #endif
 
 static const uint8_t QUESTION[16] = {5, 'p', 'r', 'o', 'b', 'e', 4, 't', 'e', 's', 't', 0, 0, 16, 0, 1};
+
+// --- optional payload encryption (--keyfile): XChaCha20-Poly1305 over the frame payload. When keyed,
+// the receiver identifies our frames by a verifying tag instead of a constant marker, so the dns
+// question and the icmp identifier can be random and carry no fixed signature. ---
+static uint64_t now_ms(void);
+static int keyed;
+static uint8_t key[32];
+static uint8_t nonce_base[16];     // random per process; with the per-frame counter the nonce never repeats
+static uint64_t nonce_ctr;         // only local_to_wire sends on the wire, so one unlocked counter is safe
+static uint8_t cur_question[16];   // the dns question actually sent: QUESTION, or random labels when keyed
+static unsigned cur_ident = IDENT; // the icmp identifier actually sent: IDENT, or random when keyed
+static uint64_t rngs;              // xorshift64 for the cosmetic per-frame txid / per-flow markers
+
+static uint64_t xrng(void) {
+  rngs ^= rngs << 13;
+  rngs ^= rngs >> 7;
+  rngs ^= rngs << 17;
+  return rngs;
+}
+
+static void rng_seed(void) {
+  if (getrandom(&rngs, sizeof rngs, 0) != sizeof rngs || !rngs) rngs = now_ms() | 1;
+}
+
+// A well-formed 5+4-label question with random a-z0-9 content; the lengths, root and type/class keep the
+// 16-byte shape so the fixed header offset still holds, but the name is no longer a constant to match on.
+static void randomize_question(void) {
+  static const char cs[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+  memcpy(cur_question, QUESTION, sizeof cur_question);
+  for (int i = 1; i <= 10; i++) {
+    if (i == 6) continue;  // the second label's length byte
+    cur_question[i] = (uint8_t)cs[xrng() % 35];
+  }
+}
+
+static void gen_nonce(uint8_t *n) {
+  memcpy(n, nonce_base, 16);
+  uint64_t c = nonce_ctr++;
+  for (int i = 0; i < 8; i++) n[16 + i] = (uint8_t)(c >> (56 - 8 * i));
+}
 
 // receive batches, one per direction: each direction runs in its own thread
 struct batch {
@@ -128,6 +174,7 @@ static void rotate_tx(void) {
   close(tx);
   tx = udp_socket(tx_bind);
   sockframes = 0;
+  if (keyed) randomize_question();  // a fresh flow gets a fresh name, so flows do not share a signature
   if (nports > 1) {
     peer_i = (peer_i + 1) % nports;
     peer = peers[peer_i];
@@ -157,7 +204,7 @@ static void dns_head(uint8_t *h, unsigned id, size_t payload) {
   static const uint8_t flags[10] = {0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
   put16(h, id);
   memcpy(h + 2, flags, sizeof flags);
-  memcpy(h + 12, QUESTION, sizeof QUESTION);
+  memcpy(h + 12, cur_question, sizeof cur_question);
   h[28] = 0;                // OPT owner name: root
   put16(h + 29, 41);        // type OPT
   put16(h + 31, 4096);      // UDP payload size
@@ -169,7 +216,7 @@ static void icmp_head(uint8_t *h, int type, unsigned seq, size_t payload) {
   h[0] = type;
   h[1] = 0;
   put16(h + 2, 0);
-  put16(h + 4, IDENT);
+  put16(h + 4, cur_ident);
   put16(h + 6, seq);
   put16(h + 2, csum(h, ICMP_HDR + payload));
 }
@@ -264,13 +311,23 @@ static void wire_flush(void) {
 // queue the frame a || b, wrapped in the facade
 static void wire_emit(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
   uint8_t *p = wbuf[nw] + HEAD;
-  size_t len = alen + blen, hdr = is_dns ? DNS_HDR : ICMP_HDR;
-  if (alen) memcpy(p, a, alen);
-  memcpy(p + alen, b, blen);
+  size_t len = alen + blen, hdr = is_dns ? DNS_HDR : ICMP_HDR, paylen;
+  if (keyed) {
+    uint8_t *pt = p + NONCE;  // payload = nonce || AEAD(frame) || tag; encrypt in place over pt
+    if (alen) memcpy(pt, a, alen);
+    memcpy(pt + alen, b, blen);
+    gen_nonce(p);
+    crypto_aead_lock(pt, pt + len, key, p, NULL, 0, pt, len);
+    paylen = NONCE + len + TAG;
+  } else {
+    if (alen) memcpy(p, a, alen);
+    memcpy(p + alen, b, blen);
+    paylen = len;
+  }
   seq++;
-  if (is_dns) dns_head(p - hdr, seq, len);
-  else icmp_head(p - hdr, itype, seq, len);
-  wiov[nw] = (struct iovec){p - hdr, hdr + len};
+  if (is_dns) dns_head(p - hdr, keyed ? (unsigned)(xrng() & 0xFFFF) : seq, paylen);
+  else icmp_head(p - hdr, itype, seq, paylen);
+  wiov[nw] = (struct iovec){p - hdr, hdr + paylen};
   wmsg[nw].msg_hdr = (struct msghdr){.msg_name = &peer, .msg_namelen = sizeof peer, .msg_iov = &wiov[nw], .msg_iovlen = 1};
   // Also flush at a rotation boundary, so one source port never carries more than --rotate frames.
   if (++nw == OUTQ || (rotate && sockframes + (unsigned long)nw >= (unsigned long)rotate)) wire_flush();
@@ -648,12 +705,13 @@ static void *wire_to_local(void *arg) {  // peer -> facade -> FEC -> tunnel
         size_t len = b->msgs[i].msg_len;
         if (b->names[i].sin_addr.s_addr != peer_addr) continue;
         if (is_dns) {
-          if (len <= DNS_HDR || memcmp(p + 12, QUESTION, sizeof QUESTION)) { ADD(nbad, 1); continue; }
+          // keyed: the tag decides, so no constant question to match on; legacy: match the fixed question
+          if (len <= DNS_HDR || (!keyed && memcmp(p + 12, QUESTION, sizeof QUESTION))) { ADD(nbad, 1); continue; }
           p += DNS_HDR;
           len -= DNS_HDR;
         } else {
           size_t ihl = (p[0] & 15) * 4;
-          if (len <= ihl + ICMP_HDR || ((p[ihl + 4] << 8) | p[ihl + 5]) != IDENT) { ADD(nbad, 1); continue; }
+          if (len <= ihl + ICMP_HDR || (!keyed && ((p[ihl + 4] << 8) | p[ihl + 5]) != IDENT)) { ADD(nbad, 1); continue; }
           if (p[ihl] != itype) {  // the peer's relay with the other ICMP_TYPE: say so once instead of going quiet
             static int warned;
             if (!warned++)
@@ -664,6 +722,14 @@ static void *wire_to_local(void *arg) {  // peer -> facade -> FEC -> tunnel
           }
           p += ihl + ICMP_HDR;
           len -= ihl + ICMP_HDR;
+        }
+        uint8_t pt[BUF];
+        if (keyed) {  // nonce || ciphertext || tag; a verifying tag is what marks the frame as ours
+          if (len < NONCE + TAG) { ADD(nbad, 1); continue; }
+          size_t ctlen = len - NONCE - TAG;
+          if (crypto_aead_unlock(pt, p + NONCE + ctlen, key, p, NULL, 0, p + NONCE, ctlen)) { ADD(nbad, 1); continue; }
+          p = pt;
+          len = ctlen;
         }
         if (p[0] == FEC_MAGIC) fec_input(p, len);
         else local_emit(p, len);
@@ -681,9 +747,10 @@ static void print_counters(void) {
 
 int main(int argc, char **argv) {
   const char *facade = NULL, *bind_ip = NULL, *peer_ip = NULL, *local = NULL, *reply_arg = NULL, *fec_arg = NULL;
-  const char *gso_arg = "on", *rotate_arg = NULL, *port_arg = "53", *rate_arg = NULL;
+  const char *gso_arg = "on", *rotate_arg = NULL, *port_arg = "53", *rate_arg = NULL, *keyfile = NULL;
   for (int i = 1; i + 1 < argc; i += 2) {
     if (!strcmp(argv[i], "--facade")) facade = argv[i + 1];
+    else if (!strcmp(argv[i], "--keyfile")) keyfile = argv[i + 1];
     else if (!strcmp(argv[i], "--bind")) bind_ip = argv[i + 1];
     else if (!strcmp(argv[i], "--peer")) peer_ip = argv[i + 1];
     else if (!strcmp(argv[i], "--local")) local = argv[i + 1];
@@ -697,7 +764,7 @@ int main(int argc, char **argv) {
   }
   if (!facade || !bind_ip || !peer_ip || !local || (strcmp(facade, "dns") && strcmp(facade, "icmp")) ||
       (strcmp(gso_arg, "on") && strcmp(gso_arg, "off"))) {
-    fprintf(stderr, "usage: %s --facade dns|icmp --bind IP --peer IP --local IP:PORT [--reply IP:PORT] [--port 53,853,...] [--itype 0] [--fec K:M] [--gso on|off] [--rotate N] [--rate N]\n", argv[0]);
+    fprintf(stderr, "usage: %s --facade dns|icmp --bind IP --peer IP --local IP:PORT [--reply IP:PORT] [--port 53,853,...] [--itype 0] [--fec K:M] [--gso on|off] [--rotate N] [--rate N] [--keyfile PATH]\n", argv[0]);
     return 1;
   }
   if (rotate_arg) {
@@ -721,6 +788,26 @@ int main(int argc, char **argv) {
   }
   gf_init();
   gf_pick();
+  memcpy(cur_question, QUESTION, sizeof cur_question);
+  if (keyfile) {
+    int fd = open(keyfile, O_RDONLY);
+    if (fd < 0) die("open keyfile");
+    uint8_t extra;
+    if (read(fd, key, sizeof key) != (ssize_t)sizeof key || read(fd, &extra, 1) != 0) {
+      fprintf(stderr, "golden-gre-relay: keyfile %s must be exactly 32 bytes\n", keyfile);
+      return 1;
+    }
+    close(fd);
+    keyed = 1;
+    rng_seed();
+    if (getrandom(nonce_base, sizeof nonce_base, 0) != (ssize_t)sizeof nonce_base) die("getrandom");
+    uint8_t p0[8] = "goldengr", c0[8], t0[TAG], o0[8], z0[NONCE] = {0};  // KAT: a miscompiled AEAD must not ship
+    crypto_aead_lock(c0, t0, key, z0, NULL, 0, p0, sizeof p0);
+    if (crypto_aead_unlock(o0, t0, key, z0, NULL, 0, c0, sizeof c0) || memcmp(p0, o0, sizeof p0))
+      die("AEAD self-test failed");
+    randomize_question();
+    cur_ident = (unsigned)(xrng() & 0xFFFF);
+  }
   // a random first block number, so the peer cannot mistake a restarted sender's blocks for old ones
   if (getrandom(&enc.id, sizeof enc.id, 0) != sizeof enc.id) enc.id = (uint32_t)now_ms();
   is_dns = !strcmp(facade, "dns");
@@ -791,8 +878,9 @@ int main(int argc, char **argv) {
   if (rotate) snprintf(rot, sizeof rot, ", rotate %d", rotate);
   if (nports > 1) snprintf(rot + strlen(rot), sizeof rot - strlen(rot), ", %d ports", nports);
   if (rate) snprintf(rot + strlen(rot), sizeof rot - strlen(rot), ", rate %d", rate);
-  printf("golden-gre-relay up: %s %s <-> %s, local %s, fec %s, gso %s, gf %s%s%s\n", facade, bind_ip, peer_ip, local,
-         fec_arg ? fec_arg : "off", use_gso ? "on" : "off", gf_impl, is_dns ? "" : itype ? ", itype 8" : ", itype 0", rot);
+  printf("golden-gre-relay up: %s %s <-> %s, local %s, fec %s, gso %s, gf %s, enc %s%s%s\n", facade, bind_ip, peer_ip, local,
+         fec_arg ? fec_arg : "off", use_gso ? "on" : "off", gf_impl, keyed ? "xchacha20-poly1305" : "off",
+         is_dns ? "" : itype ? ", itype 8" : ", itype 0", rot);
   fflush(stdout);
 
   pthread_t out_thread, in_thread;
